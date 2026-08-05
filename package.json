@@ -1,0 +1,32 @@
+{
+  "name": "annotate-ui",
+  "version": "0.1.0",
+  "description": "Point-and-click annotation overlay for any running web dev build, streamed back to a coding agent via a long-poll CLI.",
+  "type": "module",
+  "bin": {
+    "annotate-ui": "cli.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "files": [
+    "SKILL.md",
+    "cli.mjs",
+    "overlay.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "claude",
+    "skill",
+    "annotation",
+    "ui",
+    "review",
+    "dev-tools",
+    "agent"
+  ],
+  "license": "MIT"
+}
