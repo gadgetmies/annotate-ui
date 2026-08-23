@@ -194,6 +194,51 @@ export function revealPlan(annotationRoute, currentRoute) {
   return { mode: route && route !== currentRoute ? "navigate" : "inline", route };
 }
 
+// --- changelog / verification pure helpers (exported, testable) ------------
+
+// Merge an agent-delivered changelog into the existing entry list, de-duplicating
+// by `id` so a re-delivered entry never clobbers the user's in-progress row
+// state. Returns a new array; existing entries win on conflict.
+export function mergeChangelog(existing, incoming) {
+  const out = Array.isArray(existing) ? existing.slice() : [];
+  const seen = new Set(out.map((e) => e && e.id));
+  for (const e of Array.isArray(incoming) ? incoming : []) {
+    if (!e || typeof e.id !== "string" || seen.has(e.id)) continue;
+    seen.add(e.id);
+    out.push({
+      id: e.id,
+      title: typeof e.title === "string" ? e.title : e.id,
+      description: typeof e.description === "string" ? e.description : "",
+      context: e.context && typeof e.context === "object" ? e.context : null,
+    });
+  }
+  return out;
+}
+
+// Build a pending verification item for the shared submit queue. `context` is the
+// entry's auto-linked context or a re-pinned element's context (web
+// { selector, route, source, outerHTML } or a QML identity); it is spread
+// verbatim, and kind/changelogId/comment always win over any context field.
+export function buildVerificationItem(changelogId, comment, context) {
+  const ctx = context && typeof context === "object" ? context : {};
+  return { ...ctx, kind: "verification", changelogId, comment: String(comment || "").trim() };
+}
+
+// Apply one changelog row's Verified/Rejected state to the shared pending queue
+// and return the next queue. Verified (or an empty rejection comment) removes any
+// pending verification item for that id; a non-empty rejection creates or replaces
+// it. Matched by changelogId, so a row and its queued issue can never drift.
+export function applyRowState(pending, changelogId, rowState, comment, context) {
+  const next = (Array.isArray(pending) ? pending : []).filter(
+    (p) => !(p && p.kind === "verification" && p.changelogId === changelogId),
+  );
+  const trimmed = String(comment || "").trim();
+  if (rowState === "rejected" && trimmed) {
+    next.push(buildVerificationItem(changelogId, trimmed, context));
+  }
+  return next;
+}
+
 // --- interactive UI (browser only) -----------------------------------------
 
 function boot() {
@@ -203,7 +248,9 @@ function boot() {
   const STORE_KEY = "annotate-ui.pending";
   const MIN_KEY = "annotate-ui.minimized"; // panel-minimised state, survives a reveal reload
   const REVEAL_KEY = "annotate-ui.reveal"; // survives a reload so a cross-route reveal can finish after boot
+  const CHANGELOG_KEY = "annotate-ui.changelog"; // verification checklist, survives a reveal reload
   const REVEAL_BOOT_TRIES = 14; // ~2s of 150ms retries — SPA views often mount after the overlay boots
+  const initialChangelog = loadChangelog();
   const state = {
     active: false,
     pending: loadPending(),
@@ -211,6 +258,9 @@ function boot() {
     lastMessageId: 0,
     hovered: null,
     editing: null, // index of the pending row currently being edited (or null)
+    changelog: initialChangelog.list, // agent-delivered entries [{ id, title, description, context }]
+    changelogState: initialChangelog.states, // id -> { state:"unset"|"verified"|"rejected", comment, context }
+    pinningForRejection: null, // changelogId the next pick re-links to (not a standalone pin)
   };
   let revealHideTimer = null;
 
@@ -224,6 +274,39 @@ function boot() {
   function savePending() {
     try {
       sessionStorage.setItem(STORE_KEY, JSON.stringify(state.pending));
+    } catch {
+      /* ignore */
+    }
+  }
+  // The checklist (entries + per-row state) survives a reveal-navigation reload
+  // via localStorage; it is self-clearing on Send or when it empties.
+  function loadChangelog() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(CHANGELOG_KEY) || "{}");
+      return {
+        list: Array.isArray(raw.list) ? raw.list : [],
+        states: raw.states && typeof raw.states === "object" ? raw.states : {},
+      };
+    } catch {
+      return { list: [], states: {} };
+    }
+  }
+  function saveChangelog() {
+    try {
+      localStorage.setItem(
+        CHANGELOG_KEY,
+        JSON.stringify({ list: state.changelog, states: state.changelogState }),
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+  function clearChangelog() {
+    state.changelog = [];
+    state.changelogState = {};
+    state.pinningForRejection = null;
+    try {
+      localStorage.removeItem(CHANGELOG_KEY);
     } catch {
       /* ignore */
     }
@@ -266,6 +349,7 @@ function boot() {
   const revealHl = root.getElementById("reveal-hl");
   const panel = root.getElementById("panel");
   const listEl = root.getElementById("list");
+  const checklistEl = root.getElementById("checklist");
   const msgsEl = root.getElementById("msgs");
   const toggle = root.getElementById("toggle");
   const toggleLabel = root.getElementById("toggle-label");
@@ -339,6 +423,12 @@ function boot() {
       if (!el || isOurs(el)) return;
       e.preventDefault();
       e.stopPropagation();
+      // Re-pin mode: the pick re-links the active rejection's context instead of
+      // creating a standalone pin (D5). Same capture path as a normal pin.
+      if (state.pinningForRejection) {
+        linkRejectionContext(state.pinningForRejection, extractContext(el, "", window));
+        return;
+      }
       // Snapshot the element's full context NOW — before the app (or opening our
       // own input) can dismiss a popup and detach the element. The typed comment
       // is folded into this snapshot on save.
@@ -427,28 +517,46 @@ function boot() {
 
   function renderDisplayRow(row, a, i) {
     const isNote = a.kind === "note";
+    const isVerif = a.kind === "verification";
     const cmt = document.createElement("div");
     cmt.className = "cmt";
     cmt.textContent = a.comment;
     const meta = document.createElement("div");
     meta.className = "meta";
-    // Notes aren't tied to an element — label them instead of showing a selector.
+    // Notes aren't tied to an element; a verification names the changelog entry it
+    // answers; a pin shows its source/selector.
     meta.textContent = isNote
       ? "note"
-      : (a.source?.file ? a.source.file.split("/").pop() + ":" + a.source.line : a.selector) || "";
+      : isVerif
+        ? "verification · " + (a.changelogId || "?")
+        : (a.source?.file ? a.source.file.split("/").pop() + ":" + a.source.line : a.selector) || "";
 
     const acts = document.createElement("div");
     acts.className = "acts";
-    // Reveal only makes sense for element-pinned annotations, not freeform notes.
-    if (!isNote) acts.append(mkActBtn("⌖", "Reveal in the app", () => revealAnnotation(a)));
+    // Reveal makes sense for anything with an element context (a pin, or a
+    // verification whose entry carries/gained one) — not for a freeform note.
+    const revealable = !isNote && (a.selector || (a.source && a.source.file));
+    if (revealable) acts.append(mkActBtn("⌖", "Reveal in the app", () => revealAnnotation(a)));
     acts.append(
       mkActBtn("✎", "Edit comment", () => {
         state.editing = i;
         renderList();
       }),
       mkActBtn("✕", "Delete", () => {
+        const removed = state.pending[i];
         state.pending.splice(i, 1);
         if (state.editing === i) state.editing = null;
+        // Deleting a verification issue un-rejects its checklist row, so the two
+        // views can never drift.
+        if (removed && removed.kind === "verification") {
+          const rs = state.changelogState[removed.changelogId];
+          if (rs) {
+            rs.state = "unset";
+            rs.comment = "";
+          }
+          saveChangelog();
+          renderChecklist();
+        }
         savePending();
         renderList();
       }),
@@ -463,6 +571,15 @@ function boot() {
     const commit = () => {
       const v = ta.value.trim();
       if (v) a.comment = v; // empty edit keeps the original — use ✕ to remove
+      // Mirror an edited verification comment back to its checklist row.
+      if (a.kind === "verification") {
+        const rs = state.changelogState[a.changelogId];
+        if (rs) {
+          rs.comment = a.comment;
+          saveChangelog();
+          renderChecklist();
+        }
+      }
       state.editing = null;
       savePending();
       renderList();
@@ -499,6 +616,143 @@ function boot() {
     b.title = title;
     b.onclick = onClick;
     return b;
+  }
+
+  // --- verification checklist ------------------------------------------------
+
+  function entryById(id) {
+    return state.changelog.find((e) => e.id === id) || null;
+  }
+  function rowState(id) {
+    return (
+      state.changelogState[id] ||
+      (state.changelogState[id] = { state: "unset", comment: "", context: null })
+    );
+  }
+  // The effective context for a row: a re-pinned element wins over the entry's
+  // agent-provided context; either may be absent (display-only until re-pinned).
+  function rowContext(id) {
+    const rs = state.changelogState[id];
+    if (rs && rs.context) return rs.context;
+    const e = entryById(id);
+    return e && e.context ? e.context : null;
+  }
+
+  // Render the agent-delivered changelog as a per-row Verified/Rejected checklist.
+  // Kept separate from renderList so typing in a row's issue box (which re-renders
+  // the pending list) never rebuilds — and refocuses — this section.
+  function renderChecklist() {
+    checklistEl.innerHTML = "";
+    if (!state.changelog.length) {
+      checklistEl.style.display = "none";
+      return;
+    }
+    checklistEl.style.display = "block";
+    const head = document.createElement("div");
+    head.className = "cl-head";
+    head.textContent = "Changelog — verify each change";
+    checklistEl.appendChild(head);
+
+    state.changelog.forEach((entry) => {
+      const rs = rowState(entry.id);
+      const row = document.createElement("div");
+      row.className = "cl-row";
+      if (rs.state === "verified") row.classList.add("is-verified");
+
+      const title = document.createElement("div");
+      title.className = "cl-title";
+      title.textContent = entry.title || entry.id; // text only — never markup
+      row.appendChild(title);
+      if (entry.description) {
+        const d = document.createElement("div");
+        d.className = "cl-desc";
+        d.textContent = entry.description;
+        row.appendChild(d);
+      }
+
+      const ctrls = document.createElement("div");
+      ctrls.className = "cl-ctrls";
+      const vBtn = document.createElement("button");
+      vBtn.className = "cl-verify" + (rs.state === "verified" ? " on" : "");
+      vBtn.textContent = "✓ Verified";
+      vBtn.onclick = () => setRowState(entry.id, "verified");
+      const rBtn = document.createElement("button");
+      rBtn.className = "cl-reject" + (rs.state === "rejected" ? " on" : "");
+      rBtn.textContent = "✕ Rejected";
+      rBtn.onclick = () => setRowState(entry.id, "rejected");
+      ctrls.append(vBtn, rBtn);
+      const ctx = rowContext(entry.id);
+      if (ctx && (ctx.selector || (ctx.source && ctx.source.file))) {
+        ctrls.append(mkActBtn("⌖", "Reveal in the app", () => revealAnnotation(ctx)));
+      }
+      row.appendChild(ctrls);
+
+      if (rs.state === "rejected") {
+        const ta = document.createElement("textarea");
+        ta.className = "cl-issue";
+        ta.value = rs.comment || "";
+        ta.placeholder = "What's wrong? (sent to the agent as an issue)";
+        ta.addEventListener("input", () => {
+          rs.comment = ta.value;
+          state.pending = applyRowState(state.pending, entry.id, "rejected", rs.comment, rowContext(entry.id));
+          savePending();
+          saveChangelog();
+          renderList(); // reflect the queued issue + count; leaves this textarea focused
+        });
+        row.appendChild(ta);
+
+        const repin = document.createElement("button");
+        const arming = state.pinningForRejection === entry.id;
+        repin.className = "cl-repin" + (arming ? " on" : "");
+        repin.textContent = arming ? "◎ Click an element…" : "⌖ Re-pin element";
+        repin.onclick = () => startRepin(entry.id);
+        row.appendChild(repin);
+      }
+      checklistEl.appendChild(row);
+    });
+  }
+
+  // Toggle a row to Verified or Rejected (mutually exclusive). Verified dismisses
+  // the issue box and drops any pending verification item for the row.
+  function setRowState(id, s) {
+    const rs = rowState(id);
+    rs.state = s;
+    if (s === "verified") {
+      rs.comment = "";
+      if (state.pinningForRejection === id) state.pinningForRejection = null;
+    }
+    state.pending = applyRowState(state.pending, id, rs.state, rs.comment, rowContext(id));
+    savePending();
+    saveChangelog();
+    renderChecklist();
+    renderList();
+  }
+
+  // Arm re-pin for a row: the next annotate-mode pick links its element context to
+  // this rejection instead of creating a standalone pin.
+  function startRepin(id) {
+    const rs = rowState(id);
+    if (rs.state !== "rejected") rs.state = "rejected";
+    state.pinningForRejection = id;
+    setActive(true);
+    saveChangelog();
+    renderChecklist();
+    flash("Click an element to link it to this issue");
+  }
+
+  // Finish a re-pin: attach the freshly captured context to the rejection and
+  // refresh its pending item, then leave annotate mode.
+  function linkRejectionContext(id, ctx) {
+    const rs = rowState(id);
+    rs.context = ctx;
+    state.pinningForRejection = null;
+    setActive(false);
+    state.pending = applyRowState(state.pending, id, rs.state, rs.comment, rs.context);
+    savePending();
+    saveChangelog();
+    renderChecklist();
+    renderList();
+    flash("Element linked to the issue ✓");
   }
 
   // Freeform-note composer: a small textarea at the panel bottom that grows with
@@ -615,6 +869,9 @@ function boot() {
       if (res.ok) {
         state.pending = [];
         savePending();
+        // The verification round is submitted with the batch — clear the checklist.
+        clearChangelog();
+        renderChecklist();
         renderList();
         flash("Sent to agent ✓");
       } else {
@@ -641,11 +898,19 @@ function boot() {
         const { messages } = await res.json();
         for (const m of messages) {
           state.lastMessageId = Math.max(state.lastMessageId, m.id);
-          const div = document.createElement("div");
-          div.className = "msg";
-          div.textContent = "🤖 " + m.message;
-          msgsEl.appendChild(div);
-          msgsEl.scrollTop = msgsEl.scrollHeight;
+          // A typed changelog becomes the verification checklist; a plain reply is
+          // shown as a message line; an unknown type is ignored without error.
+          if (m && m.type === "changelog" && Array.isArray(m.changelog)) {
+            state.changelog = mergeChangelog(state.changelog, m.changelog);
+            saveChangelog();
+            renderChecklist();
+          } else if (m && typeof m.message === "string") {
+            const div = document.createElement("div");
+            div.className = "msg";
+            div.textContent = "🤖 " + m.message;
+            msgsEl.appendChild(div);
+            msgsEl.scrollTop = msgsEl.scrollHeight;
+          }
         }
       }
     } catch {
@@ -656,6 +921,7 @@ function boot() {
 
   setActive(false);
   renderList();
+  renderChecklist();
   pollMessages();
   consumeRevealTarget();
 }
@@ -690,6 +956,24 @@ const TEMPLATE = `
   #min:hover { color:#e8eaed; background:#24272e }
   #hint { margin:-2px 0 8px; font-size:11px; line-height:1.35; color:#6b7178 }
   #hint b { color:#9aa0a6; font-weight:600 }
+  #checklist { display:none; margin:2px 0 8px; border-top:1px solid #24272e }
+  .cl-head { font-size:11px; color:#9aa0a6; font-weight:600; margin:8px 0 2px }
+  .cl-row { padding:6px 0; border-top:1px solid #1c1f25 }
+  .cl-row.is-verified { opacity:.7 }
+  .cl-title { font-size:13px; color:#e8eaed }
+  .cl-desc { font-size:11px; color:#8b9199; margin-top:1px }
+  .cl-ctrls { display:flex; gap:6px; align-items:center; margin-top:5px }
+  .cl-ctrls button { background:#24272e; border:1px solid #3a3f47; color:#c9cdd3; cursor:pointer;
+        font-size:11px; padding:3px 8px; border-radius:6px; line-height:1 }
+  .cl-ctrls button:hover { color:#e8eaed }
+  .cl-ctrls .cl-verify.on { background:#1f5130; border-color:#2f7d49; color:#c9ffd8 }
+  .cl-ctrls .cl-reject.on { background:#5a2530; border-color:#8a3b48; color:#ffd6dc }
+  .cl-issue { width:100%; height:48px; resize:vertical; margin-top:6px; background:#0e1013;
+        color:#e8eaed; border:1px solid #3a3f47; border-radius:6px; padding:6px; font-size:13px;
+        font-family:inherit }
+  .cl-repin { margin-top:6px; background:#24272e; border:1px solid #3a3f47; color:#c9cdd3;
+        cursor:pointer; font-size:11px; padding:3px 8px; border-radius:6px }
+  .cl-repin.on { background:#2b5fd0; border-color:#2b5fd0; color:#fff }
   .row { display:grid; grid-template-columns:1fr auto; gap:2px 8px; padding:6px 0;
         border-top:1px solid #24272e; align-items:center }
   .row .cmt { grid-column:1; }
@@ -736,6 +1020,7 @@ const TEMPLATE = `
     <button id="min" title="Minimise">–</button>
   </div>
   <div id="hint"><b>Alt/⌥-click</b> to use the app (open menus &amp; popups), then click inside to annotate.</div>
+  <div id="checklist"></div>
   <div id="list"></div>
   <textarea id="composer" rows="1" placeholder="Add a note… (⌘/Ctrl+Enter)"></textarea>
   <div id="actions"><button id="send" disabled>Send to agent</button><span id="flash"></span></div>

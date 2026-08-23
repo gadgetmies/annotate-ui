@@ -25,14 +25,33 @@ Qt Quick app (C++ **or** Python) and for what it emits.
 
 ### Optional `annotateHost` methods
 
-Both are optional; implement neither, one, or both. Each takes the picked item and
-returns a string.
+All are optional; implement any subset. If a hook is absent the overlay degrades
+gracefully (no persistence, or its own derived value).
 
 - `sourceFile(item) → string` — the item's **source `.qml` path** (ideally
   repo-relative), which pure QML cannot obtain. `""` ⇒ `qmlFile` is left empty and the
   agent greps by `objectName`/`qmlType` instead.
 - `typeName(item) → string` — override the type name the overlay derives from
   `String(item)`. Return `""` to keep the overlay's own value. Rarely needed.
+- `loadPending() → string` / `savePending(json: string)` — **pending-pin
+  persistence.** When both are present the overlay mirrors its queued pins to
+  durable storage: it calls `savePending(JSON.stringify(pins))` whenever the queue
+  changes (and `savePending("[]")` after a successful Send), and calls
+  `loadPending()` on startup to restore them. The host stores the raw JSON string
+  verbatim (it never parses it — the overlay owns the payload shape). This is what
+  makes annotations survive a quit/crash or a relaunch-to-fix-the-URL; without the
+  hooks the queue is in-memory only. (Reference host: writes
+  `$ANNOTATE_STATE_DIR/pending.json`, clearing the file on an empty queue.)
+
+### Connection confirmation (overlay-side, no host code)
+
+The overlay probes `GET <serverUrl>/__annotate/messages` and only lets the user
+**enter annotate mode once the server has answered** — so pins are never made
+against a dead server and lost. The pill reflects live reachability
+(`✎ Annotate` / `⚠ server offline` / `… Connecting`), and when disconnected the
+panel exposes a field to **set/correct the server URL at runtime**
+(`serverUrlOverride`), so a wrong or unset startup URL is recoverable without
+relaunching. None of this needs host code.
 
 ## Resolving `annotateServerUrl`
 
@@ -60,6 +79,37 @@ A freeform note (from the composer) instead carries:
 `kind:"note"` is the shared contract the CLI renders as "freeform note (not tied to a
 specific element)". A `screenshot` field (a data URL) is part of the contract but the
 generic overlay never sets it — pure QML can't produce base64; a future host hook may.
+
+### Changelog verification (typed reply message + verification item)
+
+The overlay also renders an agent-delivered **changelog** as a per-row Verified/Rejected
+checklist. This needs **no new host hooks** — it rides the existing `/__annotate/messages`
+reply channel and the existing `/__annotate/submit` queue (and its `savePending` persistence).
+
+The agent delivers the changelog (via `annotate-ui poll --changelog`) as a **typed** message on
+`<serverUrl>/__annotate/messages`, alongside plain replies:
+
+    { "id": 7, "type": "changelog",
+      "changelog": [
+        { "id": "c1", "title": "Star now gold", "description": "…",
+          "context": { "objectName": "starBtn", "qmlType": "Button",
+                       "qmlFile": "Rating.qml", "typeChain": ["Row"] } },
+        { "id": "c2", "title": "Debounced search" }          // no context → display-only
+      ] }
+
+The overlay branches on `type`: a `"changelog"` message becomes the checklist; a plain reply (no
+`type`) is shown as a message line; an **unknown `type` is ignored** without error. When the user
+**Rejects** a row and describes the issue, the overlay queues a verification item into the same
+pending array it POSTs to `/__annotate/submit`:
+
+    { "surface": "qml", "kind": "verification",
+      "changelogId": "c1", "comment": "still orange after the fix",
+      // context auto-linked from the entry, or replaced by a re-pin:
+      "objectName": "starBtn", "qmlType": "Button", "qmlFile": "Rating.qml", "typeChain": ["Row"] }
+
+`kind:"verification"` is the shared discriminator (the web overlay emits the same shape with its DOM
+context fields). Verified rows queue nothing — the agent infers them from the absence of a rejection.
+All `title`/`description`/`comment` strings are rendered via `Text` only, never as markup.
 
 ## Host shim sketch — C++
 
@@ -115,9 +165,11 @@ you get every field except `qmlFile`, which stays empty.
 
 ## Testing note
 
-This is a QML file, so there is no Node-runnable test for it in the skill. Validate it
-by loading it in a headless Qt app (`QT_QPA_PLATFORM=offscreen`) with a stub
-`annotateServerUrl` and asserting it instantiates without errors; the overlay's
-`cleanType()` is invokable via `QMetaObject.invokeMethod` for a pure-logic unit test.
-The reference PySide6 host + such a test live in the companion desktop app that vendors
-this exact file.
+This is a QML file, so it has no Node-runnable test. It is validated offscreen with
+`qmltestrunner`: `test/qml/tst_changelog.qml` loads the overlay headless
+(`QT_QPA_PLATFORM=offscreen QT_QUICK_CONTROLS_STYLE=Basic`) and exercises the
+changelog-verification logic (parse, reject→queue, verify→remove, re-pin, mixed batch) —
+run it with `npm run test:qml`. You can validate a host integration the same way: load the
+overlay with a stub `annotateServerUrl` and assert it instantiates without errors; the
+overlay's `cleanType()` is invokable via `QMetaObject.invokeMethod` for a pure-logic unit
+test. The reference PySide6 host lives in the companion desktop app that vendors this file.

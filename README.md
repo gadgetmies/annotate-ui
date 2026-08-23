@@ -11,6 +11,11 @@ It works by running a transparent reverse proxy in front of your dev server: it 
 overlay `<script>` into HTML responses, tunnels the HMR websocket so hot-reload keeps working, and
 serves callback routes under `/__annotate/*`. **No changes to your app or its build.**
 
+The loop runs both ways: after fixing, the agent can push back a **changelog** — a list of what it
+changed — which the overlay renders as a **Verified / Rejected checklist**. You sign off on each item
+in place; a rejection (with an optional re-pin to the right element) comes back to the agent as an
+issue already tied to that change. See [Changelog verification](#changelog-verification).
+
 ## Requirements
 
 - Node **≥ 18**. That's it — **zero runtime dependencies** (Node built-ins only).
@@ -56,6 +61,19 @@ $CLI stop
 Open the **proxy** URL (default `http://127.0.0.1:6100`) in your browser, click **✎ Annotate**,
 click any element, type a note, and **Send to agent**.
 
+## How the agent applies fixes
+
+To keep each round tight, the agent **delegates every annotation to its own subagent** with a narrow
+brief — the exact fix that pin asks for plus whatever context locates the element (for web pins,
+`source`/`selector`/`outerHTML`; for **QML** pins, `qmlFile`/`objectName`/`qmlType`/`typeChain`) — and
+an instruction to touch **only** what the annotation requires. Isolating each fix in its own context
+keeps one annotation's work from bleeding into another and holds scope creep in check.
+
+After a larger change (or a batch of them), the agent will **suggest you run `/clear`** before the
+next round. Clearing drops the accumulated implementation detail from the conversation, which lowers
+token usage and keeps performance and result quality high. The proxy and `poll` loop are unaffected —
+just re-run `$CLI poll` afterward.
+
 ## Editing & revealing pins
 
 Each pending annotation in the panel has three controls before you send:
@@ -80,6 +98,25 @@ textarea that grows as you type) adds a **freeform note** — general feedback n
 Type it and press **⌘/Ctrl+Enter**; it drops into the same list, editable and deletable like any
 other entry (it just has no **⌖ reveal**, since there's nothing to point at). Notes are delivered in
 the same batch tagged `kind: "note"` with no element context.
+
+## Changelog verification
+
+After a round of fixes, the agent can deliver a **changelog** — a structured list of what it changed —
+which the overlay renders as a **checklist** in the same panel as your pins. Each row has **Verified**
+and **Rejected** controls:
+
+- **Verified** — the change looks right; nothing is sent back for that item.
+- **Rejected** — reveals a textbox to describe what's still wrong. The issue is queued as a pending
+  item **already linked to that change's element**, so the agent gets it with context. You can
+  optionally **⌖ re-pin** a different element (click it, as when annotating) to correct or add the
+  location.
+
+Rejections ride the **same Send** as your pins and notes — collect your sign-off across the whole
+checklist, then send it all in one batch. On the wire each is a `kind: "verification"` item carrying
+the change's id, your comment, and its element context. Verified items send nothing (the agent infers
+them from the absence of a rejection). The same checklist works in the QML overlay.
+
+The agent drives it with `poll --changelog <file|json>`; you never run anything extra.
 
 ## Ports & env
 

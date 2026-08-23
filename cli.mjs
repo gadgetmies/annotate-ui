@@ -352,13 +352,25 @@ function handleCallback(req, res, url, state) {
       } catch {
         return sendJson(res, 400, { ok: false });
       }
-      const message = String(parsed.message || "").trim();
-      if (message) {
+      // A typed changelog message rides the same channel as a plain reply; it is
+      // stored verbatim (type + changelog carried through unchanged) so overlays
+      // can branch on `type`. Plain replies keep their { id, message } shape.
+      if (parsed.type === "changelog" && Array.isArray(parsed.changelog)) {
         state.messages.push({
           id: state.nextMessageId++,
           at: new Date().toISOString(),
-          message,
+          type: "changelog",
+          changelog: parsed.changelog,
         });
+      } else {
+        const message = String(parsed.message || "").trim();
+        if (message) {
+          state.messages.push({
+            id: state.nextMessageId++,
+            at: new Date().toISOString(),
+            message,
+          });
+        }
       }
       sendJson(res, 200, { ok: true });
     });
@@ -655,16 +667,83 @@ export function formatBatchMarkdown(batch) {
       lines.push("");
       return;
     }
+    // A verification issue answers a changelog entry; render its changelogId so
+    // it reads as sign-off feedback, distinct from a fresh pin, then fall through
+    // to its (auto-linked or re-pinned) element context below.
+    if (a.kind === "verification") {
+      lines.push(`- verification issue — answers changelog \`${a.changelogId ?? "?"}\``);
+    }
     if (a.source && a.source.file) {
       lines.push(`- source: \`${a.source.file}:${a.source.line}\`${a.source.component ? ` (<${a.source.component}>)` : ""}`);
     }
     if (a.route) lines.push(`- route: \`${a.route}\``);
     if (a.selector) lines.push(`- selector: \`${a.selector}\``);
     if (a.a11yName) lines.push(`- a11y: ${a.role || "?"} "${a.a11yName}"`);
+    // QML identity (present on `surface:"qml"` pins/verifications) — no exact line.
+    if (a.objectName) lines.push(`- objectName: \`${a.objectName}\``);
+    if (a.qmlType) lines.push(`- qmlType: \`${a.qmlType}\``);
+    if (a.qmlFile) lines.push(`- qmlFile: \`${a.qmlFile}\``);
     if (a.outerHTML) lines.push(`- html: \`${a.outerHTML}\``);
     lines.push("");
   });
   return lines.join("\n");
+}
+
+// Validate a parsed changelog: an array of { id, title, description?, context? }
+// entries. Returns a normalised copy (only known fields). Throws Error with a
+// clear, user-facing message on any problem.
+export function validateChangelog(parsed) {
+  if (!Array.isArray(parsed)) {
+    throw new Error("changelog must be a JSON array of entries");
+  }
+  return parsed.map((e, i) => {
+    if (!e || typeof e !== "object" || Array.isArray(e)) {
+      throw new Error(`changelog entry #${i + 1} must be an object`);
+    }
+    if (typeof e.id !== "string" || e.id.trim() === "") {
+      throw new Error(`changelog entry #${i + 1} needs a non-empty string "id"`);
+    }
+    if (typeof e.title !== "string" || e.title.trim() === "") {
+      throw new Error(`changelog entry #${i + 1} (${e.id}) needs a non-empty string "title"`);
+    }
+    if (e.description !== undefined && typeof e.description !== "string") {
+      throw new Error(`changelog entry ${e.id}: "description" must be a string`);
+    }
+    if (
+      e.context !== undefined &&
+      (typeof e.context !== "object" || e.context === null || Array.isArray(e.context))
+    ) {
+      throw new Error(`changelog entry ${e.id}: "context" must be an object`);
+    }
+    const out = { id: e.id, title: e.title };
+    if (e.description !== undefined) out.description = e.description;
+    if (e.context !== undefined) out.context = e.context;
+    return out;
+  });
+}
+
+// Resolve a `--changelog <file|json>` argument to a validated changelog array.
+// The argument is read as a file when it names an existing one, otherwise parsed
+// as inline JSON. Throws Error with a clear message on any problem.
+export function readChangelog(input) {
+  if (typeof input !== "string" || input.trim() === "") {
+    throw new Error("--changelog requires a file path or inline JSON");
+  }
+  let text = input;
+  try {
+    if (fs.existsSync(input) && fs.statSync(input).isFile()) {
+      text = fs.readFileSync(input, "utf8");
+    }
+  } catch {
+    /* not a readable file — fall through to inline JSON parse */
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`--changelog is neither a readable file nor valid JSON: ${e.message}`);
+  }
+  return validateChangelog(parsed);
 }
 
 async function cmdPoll(flags) {
@@ -681,6 +760,22 @@ async function cmdPoll(flags) {
       process.stderr.write("annotate-ui: reply sent to browser.\n");
     } catch (e) {
       process.stderr.write(`annotate-ui: could not send reply (${e.message}).\n`);
+    }
+  }
+  // Deliver a structured changelog (composes with --agent-reply — both are sent).
+  if (flags.changelog !== undefined) {
+    let changelog;
+    try {
+      changelog = readChangelog(typeof flags.changelog === "string" ? flags.changelog : "");
+    } catch (e) {
+      process.stderr.write(`error: ${e.message}\n`);
+      process.exit(2);
+    }
+    try {
+      await httpJson("POST", base + PREFIX + "reply", { type: "changelog", changelog });
+      process.stderr.write(`annotate-ui: changelog (${changelog.length} item(s)) sent to overlay.\n`);
+    } catch (e) {
+      process.stderr.write(`annotate-ui: could not send changelog (${e.message}).\n`);
     }
   }
   const timeout = Number(flags.timeout || 25);
@@ -742,9 +837,14 @@ Usage:
       overlay). It POSTs to /__annotate/submit and reads /__annotate/messages;
       you receive pins with the same 'poll' command.
 
-  annotate-ui poll [--agent-reply "<msg>"] [--timeout <secs=25>]
+  annotate-ui poll [--agent-reply "<msg>"] [--changelog <file|json>] [--timeout <secs=25>]
       Block until the user sends annotations; print them as JSON + markdown.
       --agent-reply posts a message into the browser panel first.
+      --changelog delivers a structured changelog — a JSON array (file path or
+        inline) of { id, title, description?, context? } entries — that the
+        overlay renders as a Verified/Rejected checklist. Rejections come back
+        through this same poll as kind:"verification" items tied to changelogId.
+        Composes with --agent-reply.
 
   annotate-ui stop
       Shut down the running serve session.

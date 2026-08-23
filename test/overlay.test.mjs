@@ -4,7 +4,16 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findReactSource, buildSelector, extractContext, cappedOuterHTML, revealPlan } from "../overlay.js";
+import {
+  findReactSource,
+  buildSelector,
+  extractContext,
+  cappedOuterHTML,
+  revealPlan,
+  mergeChangelog,
+  buildVerificationItem,
+  applyRowState,
+} from "../overlay.js";
 
 // --- minimal fake element ---------------------------------------------------
 
@@ -116,4 +125,64 @@ test("extractContext produces the full baseline payload", () => {
   assert.equal(ctx.a11yName, "Rate 3 stars");
   assert.equal(ctx.source, null);
   assert.ok("outerHTML" in ctx && "ancestors" in ctx && "selector" in ctx);
+});
+
+// --- changelog verification helpers ----------------------------------------
+
+test("mergeChangelog appends new entries and de-dupes by id (existing wins)", () => {
+  const first = mergeChangelog([], [
+    { id: "c1", title: "Star gold", description: "d", context: { selector: ".s" } },
+    { id: "c2", title: "Debounced" },
+  ]);
+  assert.equal(first.length, 2);
+  assert.equal(first[1].description, ""); // normalised default
+  assert.equal(first[1].context, null);
+  // A re-delivered c1 (even with a different title) must not clobber the existing.
+  const merged = mergeChangelog(first, [{ id: "c1", title: "CHANGED" }, { id: "c3", title: "New" }]);
+  assert.equal(merged.length, 3);
+  assert.equal(merged.find((e) => e.id === "c1").title, "Star gold");
+});
+
+test("buildVerificationItem carries kind/changelogId/comment over its context", () => {
+  const item = buildVerificationItem("c1", "  still orange  ", {
+    selector: ".rating > svg",
+    route: "/movie/42",
+    source: { file: "src/Rating.tsx", line: 18 },
+    comment: "", // a raw extractContext snapshot has an empty comment — must not win
+  });
+  assert.equal(item.kind, "verification");
+  assert.equal(item.changelogId, "c1");
+  assert.equal(item.comment, "still orange"); // trimmed, and overrides context.comment
+  assert.equal(item.selector, ".rating > svg");
+  assert.equal(item.route, "/movie/42");
+});
+
+test("applyRowState creates, replaces, and removes a verification item by changelogId", () => {
+  // Rejected with a comment → one verification item appears.
+  let pending = applyRowState([], "c1", "rejected", "bad", { selector: ".x" });
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].kind, "verification");
+  assert.equal(pending[0].changelogId, "c1");
+  // Editing the comment replaces (never duplicates) the same-id item.
+  pending = applyRowState(pending, "c1", "rejected", "still bad", { selector: ".x" });
+  assert.equal(pending.filter((p) => p.changelogId === "c1").length, 1);
+  assert.equal(pending[0].comment, "still bad");
+  // Verified removes it.
+  pending = applyRowState(pending, "c1", "verified", "", { selector: ".x" });
+  assert.equal(pending.length, 0);
+  // An empty rejection comment also drops it (nothing to send yet).
+  pending = applyRowState([{ kind: "verification", changelogId: "c1", comment: "x" }], "c1", "rejected", "   ", null);
+  assert.equal(pending.length, 0);
+});
+
+test("applyRowState leaves pins and notes untouched (mixed queue stays one array)", () => {
+  const base = [
+    { comment: "a pin", selector: "button.x" },
+    { kind: "note", comment: "a note" },
+  ];
+  const pending = applyRowState(base, "c1", "rejected", "an issue", { selector: ".y" });
+  assert.equal(pending.length, 3);
+  assert.equal(pending.filter((p) => p.kind === "verification").length, 1);
+  assert.equal(pending.filter((p) => p.kind === "note").length, 1);
+  assert.equal(pending.filter((p) => !p.kind).length, 1); // the pin, unchanged
 });

@@ -17,6 +17,8 @@ import {
   rewriteResponseHeaders,
   writeSession,
   readSession,
+  validateChangelog,
+  readChangelog,
   DEFAULT_PORT,
 } from "../cli.mjs";
 
@@ -135,4 +137,56 @@ test("formatBatchMarkdown labels a freeform note and omits element fields", () =
   assert.match(md, /freeform note \(not tied to a specific element\)/);
   assert.doesNotMatch(md, /selector:/); // notes carry no element context
   assert.doesNotMatch(md, /route:/);
+});
+
+test("formatBatchMarkdown renders a verification issue tied to its changelogId + context", () => {
+  const md = formatBatchMarkdown({
+    batchId: 9,
+    annotations: [
+      {
+        kind: "verification",
+        changelogId: "c1",
+        comment: "still orange on the detail page",
+        selector: ".rating > svg",
+        route: "/movie/42",
+        source: { file: "src/Rating.tsx", line: 18 },
+      },
+    ],
+  });
+  assert.match(md, /still orange on the detail page/);
+  assert.match(md, /verification issue — answers changelog `c1`/);
+  assert.match(md, /src\/Rating\.tsx:18/); // context still surfaces
+  assert.doesNotMatch(md, /freeform note/); // distinct from a note
+});
+
+test("validateChangelog accepts well-formed entries and drops unknown fields", () => {
+  const out = validateChangelog([
+    { id: "c1", title: "T", description: "d", context: { selector: ".x" }, extra: "ignored" },
+    { id: "c2", title: "U" },
+  ]);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[0], { id: "c1", title: "T", description: "d", context: { selector: ".x" } });
+  assert.deepEqual(out[1], { id: "c2", title: "U" });
+});
+
+test("validateChangelog rejects malformed changelogs with a clear message", () => {
+  assert.throws(() => validateChangelog({}), /must be a JSON array/);
+  assert.throws(() => validateChangelog([{ title: "no id" }]), /needs a non-empty string "id"/);
+  assert.throws(() => validateChangelog([{ id: "c1" }]), /needs a non-empty string "title"/);
+  assert.throws(() => validateChangelog([{ id: "c1", title: "T", context: [] }]), /"context" must be an object/);
+});
+
+test("readChangelog parses inline JSON and reads a file path", () => {
+  const inline = readChangelog('[{"id":"c1","title":"Inline"}]');
+  assert.deepEqual(inline, [{ id: "c1", title: "Inline" }]);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "annotate-cl-"));
+  const file = path.join(dir, "changelog.json");
+  fs.writeFileSync(file, JSON.stringify([{ id: "c2", title: "FromFile" }]));
+  try {
+    assert.deepEqual(readChangelog(file), [{ id: "c2", title: "FromFile" }]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.throws(() => readChangelog("not json and not a file"), /neither a readable file nor valid JSON/);
 });
