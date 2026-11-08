@@ -109,4 +109,31 @@ TestCase {
         verify(msgs.visible);
         verify(!findChild(overlay, "annotateHiddenHint").visible);
     }
+
+    function row(id) { return findChild(overlay, "changelogRow_" + id); }
+    function rowChild(id, name) { return findChild(row(id), name); }
+
+    // Clicking Verified changes the live entry (not a delegate copy), shows it
+    // on the row, queues nothing, and a second click undoes it.
+    function test_05_verified_toggles() {
+        reset();
+        overlay.connected = true;
+        many(2);
+        waitForRendering(overlay);
+        var btn = rowChild("c0", "verifyButton");
+        verify(btn);
+        mouseClick(btn);
+        compare(overlay._entryOf("c0").state, "verified");
+        verify(btn.on, "button shows the verified state");
+        verify(rowChild("c0", "verifiedNote").visible, "row says nothing is sent");
+        compare(overlay.pendingCount, 0, "verified sends nothing");
+        // A later changelog delivery rebuilds the rows; the state survives.
+        overlay._ingestChangelog([{ id: "late", title: "Late change" }]);
+        waitForRendering(overlay);
+        compare(row("c0").rowState, "verified");
+        mouseClick(rowChild("c0", "verifyButton"));
+        compare(overlay._entryOf("c0").state, "unset");
+        verify(!rowChild("c0", "verifyButton").on);
+        verify(!rowChild("c0", "verifiedNote").visible);
+    }
 }

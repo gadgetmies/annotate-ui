@@ -71,6 +71,11 @@ Item {
     // transient UI); only the pending kind:"verification" items are persisted.
     property var _changelog: []
     property string _repinFor: ""  // changelogId the next pick re-links (not a pin)
+    // Bumped after every in-place change to a row's state, so the checklist
+    // delegates re-read it. Rows are mutated in place (no _changelog
+    // reassignment, so the Repeater never rebuilds and an open issue box keeps
+    // focus); plain JS objects can't notify bindings, this counter does.
+    property int _changelogRev: 0
 
     // ---- introspection (pure QML) ------------------------------------------
     // Reduce a `String(item)` like "QQuickButton(0x…)", "Button_QMLTYPE_1(0x…)",
@@ -219,6 +224,24 @@ Item {
         }
         root._changelog = next;
     }
+    // The live entry for a changelogId (or for an entry-like object, by its id).
+    // Delegates must go through this: a Repeater over a JS array hands each
+    // delegate a *copy* of its element as `modelData`, so writing to modelData
+    // never reaches _changelog — the cause of the old "Verified does nothing".
+    function _entryOf(entryOrId) {
+        var id = (typeof entryOrId === "string") ? entryOrId : (entryOrId ? entryOrId.id : "");
+        for (var i = 0; i < root._changelog.length; ++i)
+            if (root._changelog[i].id === id)
+                return root._changelog[i];
+        return null;
+    }
+    // Read one field of a row for a binding; depends on _changelogRev so the
+    // binding re-evaluates after an in-place change.
+    function _rowField(id, key) {
+        var rev = root._changelogRev;   // dependency only
+        var e = root._entryOf(id);
+        return e ? e[key] : undefined;
+    }
     // The effective identity for a row: a re-pinned element wins over the entry's
     // agent-provided context; either may be absent.
     function _rowContext(entry) {
@@ -253,23 +276,37 @@ Item {
         root.pendingCount = next.length;
         root._persist();
     }
-    // Toggle a row Verified/Rejected. Verified clears the issue + drops its item.
-    // Mutates the entry object in place (no array reassignment ⇒ no Repeater
-    // rebuild ⇒ the open issue TextArea keeps focus); the delegate mirrors the
-    // state via its own `rowState` property.
-    function _setRowState(entry, s) {
+    // Set a row to "verified", "rejected" or back to "unset". Verified and unset
+    // clear the issue and drop its queued item. Takes the entry or its id and
+    // always mutates the live entry in place (see _entryOf), then bumps
+    // _changelogRev so the row redraws.
+    function _setRowState(entryOrId, s) {
+        var entry = root._entryOf(entryOrId);
+        if (!entry)
+            return;
         entry.state = s;
-        if (s === "verified") {
+        if (s !== "rejected") {
             entry.comment = "";
             if (root._repinFor === entry.id)
                 root._repinFor = "";
         }
         root._updateVerification(entry);
+        root._changelogRev++;
+    }
+    // Verified is a toggle: a second click returns the row to unset.
+    function _toggleVerified(id) {
+        var entry = root._entryOf(id);
+        if (entry)
+            root._setRowState(entry, entry.state === "verified" ? "unset" : "verified");
     }
     // Arm re-pin for a row: the next pick attaches identity to this rejection.
-    function _startRepin(entry) {
+    function _startRepin(entryOrId) {
+        var entry = root._entryOf(entryOrId);
+        if (!entry)
+            return;
         if (entry.state !== "rejected")
             entry.state = "rejected";
+        root._changelogRev++;
         root._repinFor = entry.id;
         root.annotating = true;
         root._setStatus("Click an element to link it to this issue", false);
@@ -285,6 +322,7 @@ Item {
                     "typeChain": info.typeChain || []
                 };
                 root._updateVerification(root._changelog[i]);
+                root._changelogRev++;
                 break;
             }
         }
@@ -295,7 +333,7 @@ Item {
     // Locate a row's item by objectName and flash the hover highlight over it —
     // the QML twin of the web overlay's reveal-by-selector.
     function _locate(entry) {
-        var ctx = root._rowContext(entry);
+        var ctx = entry ? root._rowContext(entry) : null;
         if (!ctx || !ctx.objectName) {
             root._setStatus("No locatable identity for this item", true);
             return;
@@ -545,6 +583,31 @@ Item {
         hl.width = it.width;
         hl.height = it.height;
         hl.visible = true;
+    }
+
+    // A checklist control whose "on" look does not depend on the Controls
+    // style (Button.highlighted is nearly invisible on a dark palette).
+    component RowToggle: Button {
+        id: tb
+        property bool on: false
+        property color onColor: "#1f5130"
+        property color onBorder: "#2f7d49"
+        property color onText: "#c9ffd8"
+        padding: 6
+        font.pixelSize: 12
+        contentItem: Text {
+            text: tb.text
+            font: tb.font
+            color: tb.on ? tb.onText : "#e8eaed"
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            implicitHeight: 28
+            radius: 6
+            color: tb.on ? tb.onColor : (tb.down ? "#2a2e36" : "#1f232a")
+            border.color: tb.on ? tb.onBorder : "#3a3f47"
+        }
     }
 
     // ---- hover highlight ---------------------------------------------------
@@ -914,24 +977,27 @@ Item {
                         model: root._changelog
                         delegate: Column {
                             id: clRow
+                            objectName: "changelogRow_" + entryId
                             width: checklist.width
                             spacing: 4
                             required property var modelData
-                            // Local mirror of the entry's state: mutating the plain JS
-                            // entry can't notify bindings, so the click handlers set
-                            // this explicitly to drive the row's reactive UI.
-                            property string rowState: modelData.state
+                            // modelData is a copy; only its id is used. Everything
+                            // that changes is read live from the entry.
+                            readonly property string entryId: modelData.id
+                            readonly property string rowState: root._rowField(entryId, "state") || "unset"
+                            readonly property bool verified: rowState === "verified"
                             Rectangle { width: parent.width; height: 1; color: "#1c1f25" }
                             Text {
                                 width: parent.width
                                 wrapMode: Text.WordWrap
-                                color: "#e8eaed"
+                                color: clRow.verified ? "#9dffb0" : "#e8eaed"
+                                opacity: clRow.verified ? 0.75 : 1
                                 font.pixelSize: 13
-                                text: clRow.modelData.title
+                                text: (clRow.verified ? "✓ " : "") + clRow.modelData.title
                             }
                             Text {
                                 width: parent.width
-                                visible: clRow.modelData.description.length > 0
+                                visible: !clRow.verified && clRow.modelData.description.length > 0
                                 wrapMode: Text.WordWrap
                                 color: "#8b9199"
                                 font.pixelSize: 11
@@ -939,30 +1005,40 @@ Item {
                             }
                             Row {
                                 spacing: 6
-                                Button {
-                                    text: "✓ Verified"
-                                    highlighted: clRow.rowState === "verified"
-                                    onClicked: {
-                                        root._setRowState(clRow.modelData, "verified");
-                                        clRow.rowState = "verified";
-                                    }
+                                RowToggle {
+                                    objectName: "verifyButton"
+                                    text: clRow.verified ? "✓ Verified" : "Verified"
+                                    on: clRow.verified
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: clRow.verified ? "Click to undo" : "It works — nothing is sent"
+                                    onClicked: root._toggleVerified(clRow.entryId)
                                 }
-                                Button {
+                                RowToggle {
+                                    objectName: "rejectButton"
                                     text: "✕ Rejected"
-                                    highlighted: clRow.rowState === "rejected"
-                                    onClicked: {
-                                        root._setRowState(clRow.modelData, "rejected");
-                                        clRow.rowState = "rejected";
-                                    }
+                                    on: clRow.rowState === "rejected"
+                                    onColor: "#5a2530"
+                                    onBorder: "#8a3b48"
+                                    onText: "#ffd6dc"
+                                    onClicked: root._setRowState(clRow.entryId, "rejected")
                                 }
-                                Button {
-                                    property var ctx: root._rowContext(clRow.modelData)
+                                RowToggle {
+                                    property var ctx: { root._changelogRev; return root._rowContext(root._entryOf(clRow.entryId) || {}); }
                                     visible: ctx && ctx.objectName ? true : false
                                     text: "⌖"
                                     ToolTip.visible: hovered
                                     ToolTip.text: "Locate in the app"
-                                    onClicked: root._locate(clRow.modelData)
+                                    onClicked: root._locate(root._entryOf(clRow.entryId))
                                 }
+                            }
+                            Text {
+                                objectName: "verifiedNote"
+                                width: parent.width
+                                visible: clRow.verified
+                                wrapMode: Text.WordWrap
+                                color: "#6fbf88"
+                                font.pixelSize: 11
+                                text: "Verified — nothing is sent to the agent for this item."
                             }
                             TextArea {
                                 id: issueField
@@ -972,17 +1048,20 @@ Item {
                                 placeholderText: "What's wrong? (sent to the agent as an issue)"
                                 color: "#e8eaed"
                                 background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
-                                text: clRow.modelData.comment
+                                text: root._rowField(clRow.entryId, "comment") || ""
                                 onTextChanged: {
-                                    clRow.modelData.comment = text;
-                                    root._updateVerification(clRow.modelData);
+                                    var e = root._entryOf(clRow.entryId);
+                                    if (!e || e.comment === text)
+                                        return;
+                                    e.comment = text;
+                                    root._updateVerification(e);
                                 }
                             }
                             Button {
                                 visible: clRow.rowState === "rejected"
-                                text: root._repinFor === clRow.modelData.id
+                                text: root._repinFor === clRow.entryId
                                     ? "◎ Click an element…" : "⌖ Re-pin element"
-                                onClicked: root._startRepin(clRow.modelData)
+                                onClicked: root._startRepin(clRow.entryId)
                             }
                         }
                     }
