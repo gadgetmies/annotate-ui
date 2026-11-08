@@ -218,23 +218,35 @@ export function mergeChangelog(existing, incoming) {
 // Build a pending verification item for the shared submit queue. `context` is the
 // entry's auto-linked context or a re-pinned element's context (web
 // { selector, route, source, outerHTML } or a QML identity); it is spread
-// verbatim, and kind/changelogId/comment always win over any context field.
-export function buildVerificationItem(changelogId, comment, context) {
+// verbatim, and kind/verdict/changelogId/title/comment always win over any
+// context field. `verdict` is "rejected" (with the issue as comment) or
+// "verified" (a sign-off, empty comment); an item without one is a rejection.
+export function buildVerificationItem(changelogId, comment, context, verdict = "rejected", title = "") {
   const ctx = context && typeof context === "object" ? context : {};
-  return { ...ctx, kind: "verification", changelogId, comment: String(comment || "").trim() };
+  const v = verdict === "verified" ? "verified" : "rejected";
+  return {
+    ...ctx,
+    kind: "verification",
+    verdict: v,
+    changelogId,
+    title: String(title || ""),
+    comment: v === "verified" ? "" : String(comment || "").trim(),
+  };
 }
 
 // Apply one changelog row's Verified/Rejected state to the shared pending queue
-// and return the next queue. Verified (or an empty rejection comment) removes any
-// pending verification item for that id; a non-empty rejection creates or replaces
-// it. Matched by changelogId, so a row and its queued issue can never drift.
-export function applyRowState(pending, changelogId, rowState, comment, context) {
+// and return the next queue. Verified queues a sign-off; a non-empty rejection
+// queues the issue; unset (or an empty rejection comment) queues nothing. Any
+// earlier item for the id is replaced, so a row and its queued item never drift.
+export function applyRowState(pending, changelogId, rowState, comment, context, title = "") {
   const next = (Array.isArray(pending) ? pending : []).filter(
     (p) => !(p && p.kind === "verification" && p.changelogId === changelogId),
   );
   const trimmed = String(comment || "").trim();
   if (rowState === "rejected" && trimmed) {
-    next.push(buildVerificationItem(changelogId, trimmed, context));
+    next.push(buildVerificationItem(changelogId, trimmed, context, "rejected", title));
+  } else if (rowState === "verified") {
+    next.push(buildVerificationItem(changelogId, "", context, "verified", title));
   }
   return next;
 }
@@ -518,9 +530,10 @@ function boot() {
   function renderDisplayRow(row, a, i) {
     const isNote = a.kind === "note";
     const isVerif = a.kind === "verification";
+    const isSignOff = isVerif && a.verdict === "verified";
     const cmt = document.createElement("div");
     cmt.className = "cmt";
-    cmt.textContent = a.comment;
+    cmt.textContent = isSignOff ? "✓ Verified: " + (a.title || a.changelogId || "") : a.comment;
     const meta = document.createElement("div");
     meta.className = "meta";
     // Notes aren't tied to an element; a verification names the changelog entry it
@@ -537,11 +550,16 @@ function boot() {
     // verification whose entry carries/gained one) — not for a freeform note.
     const revealable = !isNote && (a.selector || (a.source && a.source.file));
     if (revealable) acts.append(mkActBtn("⌖", "Reveal in the app", () => revealAnnotation(a)));
+    // A sign-off has no comment to edit.
+    if (!isSignOff) {
+      acts.append(
+        mkActBtn("✎", "Edit comment", () => {
+          state.editing = i;
+          renderList();
+        }),
+      );
+    }
     acts.append(
-      mkActBtn("✎", "Edit comment", () => {
-        state.editing = i;
-        renderList();
-      }),
       mkActBtn("✕", "Delete", () => {
         const removed = state.pending[i];
         state.pending.splice(i, 1);
@@ -694,7 +712,7 @@ function boot() {
         ta.placeholder = "What's wrong? (sent to the agent as an issue)";
         ta.addEventListener("input", () => {
           rs.comment = ta.value;
-          state.pending = applyRowState(state.pending, entry.id, "rejected", rs.comment, rowContext(entry.id));
+          state.pending = applyRowState(state.pending, entry.id, "rejected", rs.comment, rowContext(entry.id), entry.title);
           savePending();
           saveChangelog();
           renderList(); // reflect the queued issue + count; leaves this textarea focused
@@ -721,7 +739,7 @@ function boot() {
       rs.comment = "";
       if (state.pinningForRejection === id) state.pinningForRejection = null;
     }
-    state.pending = applyRowState(state.pending, id, rs.state, rs.comment, rowContext(id));
+    state.pending = applyRowState(state.pending, id, rs.state, rs.comment, rowContext(id), entryById(id)?.title);
     savePending();
     saveChangelog();
     renderChecklist();
@@ -747,7 +765,7 @@ function boot() {
     rs.context = ctx;
     state.pinningForRejection = null;
     setActive(false);
-    state.pending = applyRowState(state.pending, id, rs.state, rs.comment, rs.context);
+    state.pending = applyRowState(state.pending, id, rs.state, rs.comment, rs.context, entryById(id)?.title);
     savePending();
     saveChangelog();
     renderChecklist();

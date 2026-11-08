@@ -47,7 +47,8 @@ Item {
         serverUrlOverride.length > 0
             ? serverUrlOverride
             : ((typeof annotateServerUrl !== "undefined" && annotateServerUrl) ? annotateServerUrl : "")
-    readonly property var host: (typeof annotateHost !== "undefined") ? annotateHost : null
+    // Writable only so a test can hand an overlay a stub host at creation.
+    property var host: (typeof annotateHost !== "undefined") ? annotateHost : null
     function hasServer() { return root.serverUrl.length > 0; }
     // Connection health: did the callback server actually answer a probe (not
     // merely "a URL is configured")? Gates entering annotate mode + the pill state.
@@ -66,11 +67,28 @@ Item {
     // ---- changelog verification state (in-memory; pending items persist) ----
     // Agent-delivered entries, each augmented with per-row UI state:
     //   { id, title, description, context, state:"unset"|"verified"|"rejected",
-    //     comment, repin }  (repin is a re-pinned identity that overrides context)
+    //     comment, draft, editing, repin }
+    // `comment` is the rejection as added to the batch (what is queued); `draft`
+    // is the issue box's text while `editing`, not queued until submitted.
+    // `repin` is a re-pinned identity that overrides context.
     // The checklist display is best-effort in-memory (mirrors how QML treats other
     // transient UI); only the pending kind:"verification" items are persisted.
     property var _changelog: []
     property string _repinFor: ""  // changelogId the next pick re-links (not a pin)
+    // Bumped after every in-place change to a row's state, so the checklist
+    // delegates re-read it. Rows are mutated in place (no _changelog
+    // reassignment, so the Repeater never rebuilds and an open issue box keeps
+    // focus); plain JS objects can't notify bindings, this counter does.
+    property int _changelogRev: 0
+    // Checklist verdicts, kept across overlay restarts through the optional
+    // loadVerdicts/saveVerdicts host hooks (the callback server re-delivers its
+    // last changelog to a fresh overlay). Keyed by changelog id:
+    //   { hash, state: "verified"|"rejected", comment, sent, at }
+    // `hash` covers the entry's title, description and context, so a
+    // re-delivery of the same id with changed content ("fixed again, please
+    // re-check") no longer matches and the row comes back unset.
+    property var _verdicts: ({})
+    readonly property int _maxVerdicts: 500
 
     // ---- introspection (pure QML) ------------------------------------------
     // Reduce a `String(item)` like "QQuickButton(0x…)", "Button_QMLTYPE_1(0x…)",
@@ -207,17 +225,128 @@ Item {
                 if (next[j].id === e.id) { dup = true; break; }
             if (dup)
                 continue;
-            next.push({
+            var entry = {
                 "id": e.id,
                 "title": (typeof e.title === "string") ? e.title : e.id,
                 "description": (typeof e.description === "string") ? e.description : "",
                 "context": (e.context && typeof e.context === "object") ? e.context : null,
                 "state": "unset",
                 "comment": "",
+                "draft": "",
+                "editing": false,
+                "sent": false,
                 "repin": null
-            });
+            };
+            entry.hash = root._entryHash(entry);
+            root._applyVerdict(entry);
+            if (entry.sent)
+                continue;   // its verdict already reached the agent: stay hidden
+            next.push(entry);
         }
         root._changelog = next;
+    }
+    // Stable text for a value: object keys sorted, so the same content always
+    // hashes the same whatever order the agent wrote its JSON keys in.
+    function _canonical(v) {
+        if (v === null || typeof v !== "object")
+            return JSON.stringify(v === undefined ? null : v);
+        if (Array.isArray(v))
+            return "[" + v.map(root._canonical).join(",") + "]";
+        var keys = Object.keys(v).sort();
+        return "{" + keys.map(function (k) {
+            return JSON.stringify(k) + ":" + root._canonical(v[k]);
+        }).join(",") + "}";
+    }
+    // FNV-1a (32-bit) of an entry's title, description and context.
+    function _entryHash(entry) {
+        var str = root._canonical([entry.title, entry.description, entry.context]);
+        var h = 0x811c9dc5;
+        for (var i = 0; i < str.length; ++i) {
+            h ^= str.charCodeAt(i);
+            h = Math.imul(h, 0x01000193) >>> 0;
+        }
+        return ("0000000" + h.toString(16)).slice(-8);
+    }
+    // Restore a remembered verdict onto a freshly delivered entry, or forget a
+    // verdict whose entry changed (and drop its unsent rejection, which was
+    // about the old version).
+    function _applyVerdict(entry) {
+        var v = root._verdicts[entry.id];
+        if (!v)
+            return;
+        if (v.hash === entry.hash) {
+            entry.state = v.state;
+            entry.comment = v.comment || "";
+            entry.sent = v.sent === true;
+            return;
+        }
+        var next = {};
+        for (var k in root._verdicts)
+            if (k !== entry.id)
+                next[k] = root._verdicts[k];
+        root._verdicts = next;
+        root._saveVerdicts();
+        root._updateVerification(entry);   // unset → drops a stale queued item
+        root._setStatus("Some changes were updated by the agent — please check them again", false);
+    }
+    // Record (or clear) a row's verdict after any change to it. Only finished
+    // verdicts are kept: verified, or rejected with an added comment.
+    function _recordVerdict(entry) {
+        var next = {};
+        for (var k in root._verdicts)
+            if (k !== entry.id)
+                next[k] = root._verdicts[k];
+        var comment = String(entry.comment || "").trim();
+        if (entry.state === "verified" || (entry.state === "rejected" && comment.length > 0)) {
+            next[entry.id] = {
+                "hash": entry.hash || root._entryHash(entry),
+                "state": entry.state,
+                "comment": entry.state === "rejected" ? comment : "",
+                "sent": entry.sent === true,
+                "at": Date.now()
+            };
+        }
+        // Keep the store bounded: drop the oldest beyond _maxVerdicts.
+        var ids = Object.keys(next);
+        if (ids.length > root._maxVerdicts) {
+            ids.sort(function (a, b) { return (next[a].at || 0) - (next[b].at || 0); });
+            for (var i = 0; i < ids.length - root._maxVerdicts; ++i)
+                delete next[ids[i]];
+        }
+        root._verdicts = next;
+        root._saveVerdicts();
+    }
+    function _saveVerdicts() {
+        if (root.host && root.host.saveVerdicts)
+            root.host.saveVerdicts(JSON.stringify(root._verdicts));
+    }
+    function _restoreVerdicts() {
+        if (!(root.host && root.host.loadVerdicts))
+            return;
+        try {
+            var raw = root.host.loadVerdicts();
+            var obj = raw ? JSON.parse(raw) : {};
+            if (obj && typeof obj === "object" && !Array.isArray(obj))
+                root._verdicts = obj;
+        } catch (e) { /* corrupt/absent → start empty */ }
+    }
+    // The live entry for a changelogId (or for an entry-like object, by its id).
+    // Delegates must go through this: a Repeater over a JS array hands each
+    // delegate a *copy* of its element as `modelData`, so writing to modelData
+    // never reaches _changelog — the cause of the old "Verified does nothing".
+    function _entryOf(entryOrId) {
+        var id = (typeof entryOrId === "string") ? entryOrId : (entryOrId ? entryOrId.id : "");
+        for (var i = 0; i < root._changelog.length; ++i)
+            if (root._changelog[i].id === id)
+                return root._changelog[i];
+        return null;
+    }
+    // Read one field of a row for a binding; depends on _changelogRev so the
+    // binding re-evaluates after an in-place change.
+    function _rowField(id, key) {
+        var rev = root._changelogRev;   // dependency only
+        var e = root._entryOf(id);
+        return e ? e[key] : undefined;
     }
     // The effective identity for a row: a re-pinned element wins over the entry's
     // agent-provided context; either may be absent.
@@ -225,7 +354,8 @@ Item {
         return entry.repin || entry.context || null;
     }
     // Sync the shared pending queue to a row's state: drop any verification item
-    // for this changelogId, then re-add it when the row is a non-empty rejection.
+    // for this changelogId, then re-add it when the row is verified or a
+    // non-empty rejection.
     // Matched by changelogId so a row and its queued issue can never drift.
     function _updateVerification(entry) {
         var id = entry.id;
@@ -236,13 +366,18 @@ Item {
                 next.push(p);
         }
         var comment = String(entry.comment || "").trim();
-        if (entry.state === "rejected" && comment.length > 0) {
+        var rejected = entry.state === "rejected" && comment.length > 0;
+        // A verdict goes to the agent with the next Send: a rejection with its
+        // comment, or a sign-off that the change works.
+        if (rejected || entry.state === "verified") {
             var ctx = root._rowContext(entry) || {};
             next.push({
                 "surface": "qml",
                 "kind": "verification",
+                "verdict": rejected ? "rejected" : "verified",
                 "changelogId": id,
-                "comment": comment,
+                "title": entry.title || "",
+                "comment": rejected ? comment : "",
                 "objectName": ctx.objectName || "",
                 "qmlType": ctx.qmlType || "",
                 "qmlFile": ctx.qmlFile || "",
@@ -253,23 +388,99 @@ Item {
         root.pendingCount = next.length;
         root._persist();
     }
-    // Toggle a row Verified/Rejected. Verified clears the issue + drops its item.
-    // Mutates the entry object in place (no array reassignment ⇒ no Repeater
-    // rebuild ⇒ the open issue TextArea keeps focus); the delegate mirrors the
-    // state via its own `rowState` property.
-    function _setRowState(entry, s) {
+    // Set a row to "verified", "rejected" or back to "unset". Verified and unset
+    // clear the issue and drop its queued item. Takes the entry or its id and
+    // always mutates the live entry in place (see _entryOf), then bumps
+    // _changelogRev so the row redraws.
+    function _setRowState(entryOrId, s) {
+        var entry = root._entryOf(entryOrId);
+        if (!entry)
+            return;
         entry.state = s;
-        if (s === "verified") {
+        if (s !== "rejected") {
             entry.comment = "";
+            entry.draft = "";
+            entry.editing = false;
             if (root._repinFor === entry.id)
                 root._repinFor = "";
+        } else {
+            // A rejection without an added issue opens its issue box.
+            entry.editing = String(entry.comment || "").trim().length === 0;
         }
+        entry.sent = false;
         root._updateVerification(entry);
+        root._recordVerdict(entry);
+        root._changelogRev++;
+    }
+    // The Rejected button: opens the issue box on an unset/verified row, and
+    // undoes the rejection (drops its queued item) on a rejected one.
+    function _toggleRejected(id) {
+        var entry = root._entryOf(id);
+        if (entry)
+            root._setRowState(entry, entry.state === "rejected" ? "unset" : "rejected");
+    }
+    // Add (or update) a rejection in the pending batch. Rejections are not
+    // sent on their own: like pins and notes they wait for the panel's Send.
+    function _submitRejection(id, text) {
+        var entry = root._entryOf(id);
+        var t = String(text || "").trim();
+        if (!entry)
+            return false;
+        if (t.length === 0) {
+            root._setStatus("Describe what's wrong before adding the rejection", true);
+            return false;
+        }
+        entry.state = "rejected";
+        entry.comment = t;
+        entry.draft = "";
+        entry.editing = false;
+        entry.sent = false;
+        root._updateVerification(entry);
+        root._recordVerdict(entry);
+        root._changelogRev++;
+        root._setStatus("Rejection added — it goes to the agent with the next Send", false);
+        return true;
+    }
+    // Reopen an added rejection's issue box (the queued item stays until a new
+    // text is submitted or the rejection is undone).
+    function _editRejection(id) {
+        var entry = root._entryOf(id);
+        if (!entry)
+            return;
+        entry.draft = entry.comment;
+        entry.editing = true;
+        root._changelogRev++;
+    }
+    // Close the issue box without submitting: an added rejection keeps its
+    // queued text; a rejection never added goes back to unset.
+    function _cancelRejection(id) {
+        var entry = root._entryOf(id);
+        if (!entry)
+            return;
+        if (String(entry.comment || "").trim().length > 0) {
+            entry.draft = "";
+            entry.editing = false;
+            root._changelogRev++;
+        } else {
+            root._setRowState(entry, "unset");
+        }
+    }
+    // Verified is a toggle: a second click returns the row to unset.
+    function _toggleVerified(id) {
+        var entry = root._entryOf(id);
+        if (entry)
+            root._setRowState(entry, entry.state === "verified" ? "unset" : "verified");
     }
     // Arm re-pin for a row: the next pick attaches identity to this rejection.
-    function _startRepin(entry) {
-        if (entry.state !== "rejected")
+    function _startRepin(entryOrId) {
+        var entry = root._entryOf(entryOrId);
+        if (!entry)
+            return;
+        if (entry.state !== "rejected") {
             entry.state = "rejected";
+            entry.editing = true;
+        }
+        root._changelogRev++;
         root._repinFor = entry.id;
         root.annotating = true;
         root._setStatus("Click an element to link it to this issue", false);
@@ -285,6 +496,7 @@ Item {
                     "typeChain": info.typeChain || []
                 };
                 root._updateVerification(root._changelog[i]);
+                root._changelogRev++;
                 break;
             }
         }
@@ -295,7 +507,7 @@ Item {
     // Locate a row's item by objectName and flash the hover highlight over it —
     // the QML twin of the web overlay's reveal-by-selector.
     function _locate(entry) {
-        var ctx = root._rowContext(entry);
+        var ctx = entry ? root._rowContext(entry) : null;
         if (!ctx || !ctx.objectName) {
             root._setStatus("No locatable identity for this item", true);
             return;
@@ -380,6 +592,52 @@ Item {
                    ? (root.pendingCount + " queued pin(s) are kept.") : "pins will be kept."), true);
         });
     }
+    // A batch reached the server: clear the queue, remember the batch's
+    // rejections as sent, and close this verification round.
+    function _sendSucceeded(batch) {
+        root._pending = [];
+        root.pendingCount = 0;
+        root._persist();          // clears the on-disk queue too
+        // The verdicts in this batch are now with the agent: remember them as
+        // sent (an unchanged re-delivery stays hidden, also after a restart)
+        // and take those rows off the checklist. Rows not in the batch stay.
+        var nv = {};
+        for (var k in root._verdicts)
+            nv[k] = root._verdicts[k];
+        var sentIds = {};
+        for (var b = 0; b < batch.length; ++b) {
+            var it = batch[b];
+            if (!(it && it.kind === "verification"))
+                continue;
+            sentIds[it.changelogId] = true;
+            var v = nv[it.changelogId];
+            if (v)
+                nv[it.changelogId] = { "hash": v.hash, "state": v.state,
+                    "comment": v.comment, "sent": true, "at": Date.now() };
+        }
+        root._verdicts = nv;
+        root._saveVerdicts();
+        root._changelog = root._changelog.filter(function (e) { return !sentIds[e.id]; });
+        root._repinFor = "";
+        root.connected = true;
+        root._setStatus("Sent to agent ✓", false);
+    }
+    // "Send 3 to agent", or with sign-offs split out: "Send 1 · 2 verified to agent".
+    function _sendLabel() {
+        var v = 0;
+        for (var i = 0; i < root._pending.length; ++i) {
+            var p = root._pending[i];
+            if (p && p.kind === "verification" && p.verdict === "verified")
+                v++;
+        }
+        var n = root.pendingCount - v;
+        var parts = [];
+        if (n > 0 || v === 0)
+            parts.push(String(n));
+        if (v > 0)
+            parts.push(v + " verified");
+        return "Send " + parts.join(" · ") + " to agent";
+    }
     function send() {
         if (!root._pending.length)
             return;
@@ -393,13 +651,7 @@ Item {
             if (xhr.readyState !== XMLHttpRequest.DONE)
                 return;
             if (xhr.status >= 200 && xhr.status < 300) {
-                root._pending = [];
-                root.pendingCount = 0;
-                root._persist();          // clears the on-disk queue too
-                root._changelog = [];     // the verification round went with it
-                root._repinFor = "";
-                root.connected = true;
-                root._setStatus("Sent to agent ✓", false);
+                root._sendSucceeded(batch);
             } else {
                 root._setStatus("Send failed (server down?) — pins kept, retry", true);
             }
@@ -466,6 +718,7 @@ Item {
     // pill reflects real reachability from the moment the overlay appears.
     Component.onCompleted: {
         root._restorePending();
+        root._restoreVerdicts();
         root.checkConnection();
     }
 
@@ -547,6 +800,31 @@ Item {
         hl.visible = true;
     }
 
+    // A checklist control whose "on" look does not depend on the Controls
+    // style (Button.highlighted is nearly invisible on a dark palette).
+    component RowToggle: Button {
+        id: tb
+        property bool on: false
+        property color onColor: "#1f5130"
+        property color onBorder: "#2f7d49"
+        property color onText: "#c9ffd8"
+        padding: 6
+        font.pixelSize: 12
+        contentItem: Text {
+            text: tb.text
+            font: tb.font
+            color: tb.on ? tb.onText : "#e8eaed"
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            implicitHeight: 28
+            radius: 6
+            color: tb.on ? tb.onColor : (tb.down ? "#2a2e36" : "#1f232a")
+            border.color: tb.on ? tb.onBorder : "#3a3f47"
+        }
+    }
+
     // ---- hover highlight ---------------------------------------------------
     Rectangle {
         id: hl
@@ -601,6 +879,7 @@ Item {
     // ---- comment box -------------------------------------------------------
     Rectangle {
         id: comment
+        objectName: "annotateCommentBox"
         visible: false
         z: 5
         width: 300
@@ -613,7 +892,9 @@ Item {
         property var header: ({})
 
         function openFor(item, px, py) {
-            header = root.beginPin(item);  // snapshot NOW
+            // Qualified: an unqualified `header` would resolve to any element
+            // id of that name in this file before this property.
+            comment.header = root.beginPin(item);  // snapshot NOW
             field.text = "";
             x = Math.min(px, root.width - width - 8);
             y = Math.min(py, root.height - height - 8);
@@ -639,6 +920,7 @@ Item {
             }
             TextField {
                 id: field
+                objectName: "annotateCommentField"
                 width: parent.width
                 placeholderText: "What needs fixing here? (Ctrl+Enter to add)"
                 color: "#e8eaed"
@@ -683,6 +965,7 @@ Item {
     // ---- toggle pill + pending panel --------------------------------------
     Rectangle {
         id: pill
+        objectName: "annotatePill"
         z: 6
         anchors.left: parent.left
         anchors.bottom: parent.bottom
@@ -697,9 +980,18 @@ Item {
         // Toggle annotate mode (gated on a confirmed connection). Declared before
         // pillRow so the restore glyph's own MouseArea (a child of pillRow)
         // paints/handles on top of this and can swallow its click.
+        // Takes every button, the wheel and hover over the whole pill, so none
+        // of it reaches the app underneath; only a left click toggles.
         MouseArea {
             anchors.fill: parent
-            onClicked: root.requestAnnotate()
+            acceptedButtons: Qt.AllButtons
+            hoverEnabled: true
+            preventStealing: true
+            onClicked: mouse => {
+                if (mouse.button === Qt.LeftButton)
+                    root.requestAnnotate();
+            }
+            onWheel: wheel => { wheel.accepted = true; }
         }
         Row {
             id: pillRow
@@ -737,6 +1029,7 @@ Item {
 
     Rectangle {
         id: panel
+        objectName: "annotatePanel"
         z: 6
         // Shown while annotating OR disconnected (so the recovery UI is reachable)
         // OR whenever a verification checklist is present (so the user can sign off
@@ -750,29 +1043,59 @@ Item {
         radius: 10
         color: "#14161b"
         border.color: "#3a3f47"
-        implicitHeight: pcol.implicitHeight + 20
-        height: implicitHeight
+        // Never taller than the window: the room above the pill, less a top
+        // margin. The header stays put; the body scrolls inside what is left.
+        readonly property real maxHeight: Math.max(120, pill.y - anchors.bottomMargin - 16)
+        implicitHeight: 10 + panelHeader.height + 8 + pcol.implicitHeight + 10
+        height: Math.min(implicitHeight, maxHeight)
 
-        Column {
-            id: pcol
+        // Swallow every mouse event on the panel's whole area (empty space,
+        // text, margins) so nothing falls through to the app beneath it. The
+        // controls and the scrolling body sit above this and still get theirs.
+        MouseArea {
+            objectName: "annotatePanelBlocker"
             anchors.fill: parent
+            acceptedButtons: Qt.AllButtons
+            hoverEnabled: true
+            preventStealing: true
+            onWheel: wheel => { wheel.accepted = true; }
+        }
+
+        // Header: title/count, annotate toggle and a "–" minimise button
+        // (collapses to the pill). Outside the scrolling body so it is always
+        // reachable however long the checklist or the discussion gets.
+        Item {
+            id: panelHeader
+            objectName: "annotatePanelHeader"
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
             anchors.margins: 10
-            spacing: 8
-            // Header: title/count + a "–" minimise button (collapses to the pill).
-            Item {
-                width: parent.width
-                height: minBtn.implicitHeight
-                Text {
-                    anchors.left: parent.left
+            height: minBtn.implicitHeight
+            Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                color: "#9aa0a6"
+                font.pixelSize: 12
+                font.bold: true
+                text: "Annotations (" + root.pendingCount + ")"
+            }
+            Row {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 2
+                Button {
+                    objectName: "annotateHeaderToggle"
                     anchors.verticalCenter: parent.verticalCenter
-                    color: "#9aa0a6"
+                    flat: true
+                    padding: 4
                     font.pixelSize: 12
-                    font.bold: true
-                    text: "Annotations (" + root.pendingCount + ")"
+                    text: root.annotating ? "Stop annotating" : "✎ Annotate"
+                    onClicked: root.requestAnnotate()
                 }
                 Button {
                     id: minBtn
-                    anchors.right: parent.right
+                    objectName: "annotateMinimise"
                     anchors.verticalCenter: parent.verticalCenter
                     flat: true
                     padding: 2
@@ -783,215 +1106,344 @@ Item {
                     onClicked: root.minimized = true
                 }
             }
-            Text {
-                width: parent.width
-                wrapMode: Text.WordWrap
-                color: "#6b7178"
-                font.pixelSize: 11
-                text: root.hasServer()
-                    ? "Alt/⌥-click to use the app (open menus/popups), then click to annotate."
-                    : "No annotate-ui server — run `annotate-ui serve --server-only`, then reopen."
+        }
+
+        // Scrolling body: everything below the header. Wheel and drag scroll it;
+        // the bar is shown whenever the content overflows.
+        Flickable {
+            id: body
+            objectName: "annotatePanelBody"
+            anchors.top: panelHeader.bottom
+            anchors.topMargin: 8
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: 10
+            anchors.rightMargin: 10
+            anchors.bottomMargin: 10
+            clip: true
+            contentWidth: width
+            contentHeight: pcol.implicitHeight
+            flickableDirection: Flickable.VerticalFlick
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {
+                objectName: "annotatePanelScrollBar"
+                policy: body.contentHeight > body.height ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
             }
-            // Connection status + recover a wrong/unset server URL WITHOUT
-            // relaunching — so queued pins are never lost to a bad URL.
+
             Column {
-                width: parent.width
-                spacing: 6
-                visible: !root.connected
+                id: pcol
+                width: body.width - 10   // room for the scroll bar
+                spacing: 8
                 Text {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    color: "#ffcf8f"
+                    color: "#6b7178"
                     font.pixelSize: 11
-                    text: root.checking
-                        ? "Connecting…"
-                        : ("Not connected."
-                           + (root.pendingCount > 0
-                              ? (" " + root.pendingCount + " pin(s) kept safe — fix the URL, then Send.")
-                              : " Set the callback URL, then annotate."))
+                    text: root.hasServer()
+                        ? "Alt/⌥-click to use the app (open menus/popups), then click to annotate."
+                        : "No annotate-ui server — run `annotate-ui serve --server-only`, then reopen."
                 }
-                TextField {
-                    id: urlField
+                // Connection status + recover a wrong/unset server URL WITHOUT
+                // relaunching — so queued pins are never lost to a bad URL.
+                Column {
                     width: parent.width
-                    text: root.serverUrl
-                    placeholderText: "http://127.0.0.1:6100"
+                    spacing: 6
+                    visible: !root.connected
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        color: "#ffcf8f"
+                        font.pixelSize: 11
+                        text: root.checking
+                            ? "Connecting…"
+                            : ("Not connected."
+                               + (root.pendingCount > 0
+                                  ? (" " + root.pendingCount + " pin(s) kept safe — fix the URL, then Send.")
+                                  : " Set the callback URL, then annotate."))
+                    }
+                    TextField {
+                        id: urlField
+                        width: parent.width
+                        text: root.serverUrl
+                        placeholderText: "http://127.0.0.1:6100"
+                        color: "#e8eaed"
+                        background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
+                        onAccepted: connectBtn.doConnect()
+                    }
+                    Button {
+                        id: connectBtn
+                        anchors.right: parent.right
+                        text: root.checking ? "Checking…" : "Connect"
+                        enabled: !root.checking
+                        function doConnect() {
+                            root.serverUrlOverride = urlField.text.trim();
+                            root.checkConnection(function (ok) {
+                                root._setStatus(ok ? "Connected ✓" : "Still can't reach that URL.", !ok);
+                            });
+                        }
+                        onClicked: doConnect()
+                    }
+                }
+                // While annotating, say where the checklist and replies went.
+                Text {
+                    objectName: "annotateHiddenHint"
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    color: "#6b7178"
+                    font.pixelSize: 11
+                    font.italic: true
+                    visible: root.annotating && (root._changelog.length > 0 || msgs.children.length > 0)
+                    text: "Checklist and agent replies are hidden while annotating — press Esc or Stop annotating to see them."
+                }
+                // Verification checklist — one row per agent-delivered changelog entry,
+                // mirroring the web overlay. Renders all user/agent strings via `Text`
+                // only (never as markup).
+                Column {
+                    id: checklist
+                    objectName: "annotateChecklist"
+                    width: parent.width
+                    spacing: 6
+                    // Hidden while annotating: picking needs only the composer
+                    // and Send, and the checklist would cover the app.
+                    visible: root._changelog.length > 0 && !root.annotating
+                    Text {
+                        width: parent.width
+                        color: "#9aa0a6"
+                        font.pixelSize: 11
+                        font.bold: true
+                        text: "Changelog — verify each change"
+                    }
+                    Repeater {
+                        model: root._changelog
+                        delegate: Column {
+                            id: clRow
+                            objectName: "changelogRow_" + entryId
+                            width: checklist.width
+                            spacing: 4
+                            required property var modelData
+                            // modelData is a copy; only its id is used. Everything
+                            // that changes is read live from the entry.
+                            readonly property string entryId: modelData.id
+                            readonly property string rowState: root._rowField(entryId, "state") || "unset"
+                            readonly property bool verified: rowState === "verified"
+                            readonly property bool editing: rowState === "rejected"
+                                && (root._rowField(entryId, "editing") === true)
+                            readonly property string savedComment: root._rowField(entryId, "comment") || ""
+                            // Opening the issue box puts the cursor in it.
+                            onEditingChanged: if (editing) issueField.forceActiveFocus()
+                            Rectangle { width: parent.width; height: 1; color: "#1c1f25" }
+                            Text {
+                                width: parent.width
+                                wrapMode: Text.WordWrap
+                                color: clRow.verified ? "#9dffb0" : "#e8eaed"
+                                opacity: clRow.verified ? 0.75 : 1
+                                font.pixelSize: 13
+                                text: (clRow.verified ? "✓ " : "") + clRow.modelData.title
+                            }
+                            Text {
+                                width: parent.width
+                                visible: !clRow.verified && clRow.modelData.description.length > 0
+                                wrapMode: Text.WordWrap
+                                color: "#8b9199"
+                                font.pixelSize: 11
+                                text: clRow.modelData.description
+                            }
+                            Row {
+                                spacing: 6
+                                RowToggle {
+                                    objectName: "verifyButton"
+                                    text: clRow.verified ? "✓ Verified" : "Verified"
+                                    on: clRow.verified
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: clRow.verified ? "Click to undo" : "It works"
+                                    onClicked: root._toggleVerified(clRow.entryId)
+                                }
+                                RowToggle {
+                                    objectName: "rejectButton"
+                                    text: "✕ Rejected"
+                                    on: clRow.rowState === "rejected"
+                                    onColor: "#5a2530"
+                                    onBorder: "#8a3b48"
+                                    onText: "#ffd6dc"
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: clRow.rowState === "rejected" ? "Click to undo the rejection" : "It's wrong — describe the issue"
+                                    onClicked: root._toggleRejected(clRow.entryId)
+                                }
+                                RowToggle {
+                                    property var ctx: { root._changelogRev; return root._rowContext(root._entryOf(clRow.entryId) || {}); }
+                                    visible: ctx && ctx.objectName ? true : false
+                                    text: "⌖"
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: "Locate in the app"
+                                    onClicked: root._locate(root._entryOf(clRow.entryId))
+                                }
+                            }
+                            Text {
+                                objectName: "verifiedNote"
+                                width: parent.width
+                                visible: clRow.verified
+                                wrapMode: Text.WordWrap
+                                color: "#6fbf88"
+                                font.pixelSize: 11
+                                text: "Verified — goes to the agent with the next Send."
+                            }
+                            // Issue box (while editing): nothing is queued until
+                            // "Add to batch" or Ctrl/⌘+Enter; Cancel / Esc closes it.
+                            TextArea {
+                                id: issueField
+                                objectName: "issueField"
+                                width: parent.width
+                                visible: clRow.editing
+                                wrapMode: TextArea.Wrap
+                                textFormat: TextEdit.PlainText
+                                placeholderText: "What's wrong? (Ctrl/⌘+Enter adds it to the batch)"
+                                color: "#e8eaed"
+                                background: Rectangle { color: "#0e1013"; border.color: "#8a3b48"; radius: 6 }
+                                text: root._rowField(clRow.entryId, "draft") || ""
+                                onTextChanged: {
+                                    var e = root._entryOf(clRow.entryId);
+                                    if (e)
+                                        e.draft = text;   // a draft, not queued
+                                }
+                                Keys.onPressed: ev => {
+                                    if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter)
+                                            && (ev.modifiers & (Qt.ControlModifier | Qt.MetaModifier))) {
+                                        root._submitRejection(clRow.entryId, issueField.text);
+                                        ev.accepted = true;
+                                    } else if (ev.key === Qt.Key_Escape) {
+                                        root._cancelRejection(clRow.entryId);
+                                        ev.accepted = true;
+                                    }
+                                }
+                            }
+                            Row {
+                                visible: clRow.editing
+                                spacing: 6
+                                anchors.right: parent.right
+                                RowToggle {
+                                    objectName: "cancelRejectionButton"
+                                    text: "Cancel"
+                                    onClicked: root._cancelRejection(clRow.entryId)
+                                }
+                                RowToggle {
+                                    objectName: "addRejectionButton"
+                                    text: clRow.savedComment.length > 0 ? "Update rejection" : "Add to batch"
+                                    on: issueField.text.trim().length > 0
+                                    enabled: issueField.text.trim().length > 0
+                                    onColor: "#2b5fd0"
+                                    onBorder: "#2b5fd0"
+                                    onText: "#ffffff"
+                                    onClicked: root._submitRejection(clRow.entryId, issueField.text)
+                                }
+                            }
+                            // Added rejection: what will be sent, with Edit / Undo.
+                            Column {
+                                objectName: "rejectedSummary"
+                                width: parent.width
+                                spacing: 4
+                                visible: clRow.rowState === "rejected" && !clRow.editing
+                                         && clRow.savedComment.length > 0
+                                Text {
+                                    objectName: "rejectedText"
+                                    width: parent.width
+                                    wrapMode: Text.WordWrap
+                                    textFormat: Text.PlainText
+                                    color: "#ffb3be"
+                                    font.pixelSize: 12
+                                    text: "✕ Rejected: " + clRow.savedComment
+                                }
+                                Text {
+                                    width: parent.width
+                                    wrapMode: Text.WordWrap
+                                    color: "#8b9199"
+                                    font.pixelSize: 11
+                                    text: "In the batch — goes to the agent with the next Send."
+                                }
+                                Row {
+                                    spacing: 6
+                                    RowToggle {
+                                        objectName: "editRejectionButton"
+                                        text: "Edit"
+                                        onClicked: root._editRejection(clRow.entryId)
+                                    }
+                                    RowToggle {
+                                        objectName: "undoRejectionButton"
+                                        text: "Undo"
+                                        onClicked: root._setRowState(clRow.entryId, "unset")
+                                    }
+                                }
+                            }
+                            Button {
+                                visible: clRow.rowState === "rejected"
+                                text: root._repinFor === clRow.entryId
+                                    ? "◎ Click an element…" : "⌖ Re-pin element"
+                                onClicked: root._startRepin(clRow.entryId)
+                            }
+                        }
+                    }
+                }
+                // Freeform note (not tied to an element) — mirrors the web composer.
+                TextArea {
+                    id: noteField
+                    objectName: "annotateNoteField"
+                    width: parent.width
+                    wrapMode: TextArea.Wrap
+                    placeholderText: "Add a note… (Ctrl+Enter or click Add)"
                     color: "#e8eaed"
                     background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
-                    onAccepted: connectBtn.doConnect()
+                    // Queue the freeform note and clear the field. Shared by the
+                    // Ctrl+Enter shortcut and the explicit Add button.
+                    function doAdd() {
+                        if (noteField.text.trim().length > 0) {
+                            root.commitNote(noteField.text);
+                            noteField.text = "";
+                        }
+                    }
+                    Keys.onPressed: ev => {
+                        if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter)
+                                && (ev.modifiers & Qt.ControlModifier)) {
+                            noteField.doAdd();
+                            ev.accepted = true;
+                        }
+                    }
                 }
-                Button {
-                    id: connectBtn
+                // Explicit Add button for the freeform note (twin of the Ctrl+Enter
+                // shortcut), so a note can be queued with the mouse alone.
+                Row {
+                    spacing: 8
                     anchors.right: parent.right
-                    text: root.checking ? "Checking…" : "Connect"
-                    enabled: !root.checking
-                    function doConnect() {
-                        root.serverUrlOverride = urlField.text.trim();
-                        root.checkConnection(function (ok) {
-                            root._setStatus(ok ? "Connected ✓" : "Still can't reach that URL.", !ok);
-                        });
+                    Button {
+                        text: "Add note"
+                        enabled: noteField.text.trim().length > 0
+                        onClicked: noteField.doAdd()
                     }
-                    onClicked: doConnect()
                 }
-            }
-            // Verification checklist — one row per agent-delivered changelog entry,
-            // mirroring the web overlay. Renders all user/agent strings via `Text`
-            // only (never as markup).
-            Column {
-                id: checklist
-                width: parent.width
-                spacing: 6
-                visible: root._changelog.length > 0
+                Row {
+                    spacing: 8
+                    Button {
+                        objectName: "annotateSend"
+                        text: root._sendLabel()
+                        enabled: root.pendingCount > 0
+                        onClicked: root.send()
+                    }
+                }
                 Text {
+                    id: status
+                    visible: root.statusText.length > 0
                     width: parent.width
-                    color: "#9aa0a6"
-                    font.pixelSize: 11
-                    font.bold: true
-                    text: "Changelog — verify each change"
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: 12
+                    color: root.statusError ? "#ff9d9d" : "#9dffb0"
+                    text: root.statusText
                 }
-                Repeater {
-                    model: root._changelog
-                    delegate: Column {
-                        id: clRow
-                        width: checklist.width
-                        spacing: 4
-                        required property var modelData
-                        // Local mirror of the entry's state: mutating the plain JS
-                        // entry can't notify bindings, so the click handlers set
-                        // this explicitly to drive the row's reactive UI.
-                        property string rowState: modelData.state
-                        Rectangle { width: parent.width; height: 1; color: "#1c1f25" }
-                        Text {
-                            width: parent.width
-                            wrapMode: Text.WordWrap
-                            color: "#e8eaed"
-                            font.pixelSize: 13
-                            text: clRow.modelData.title
-                        }
-                        Text {
-                            width: parent.width
-                            visible: clRow.modelData.description.length > 0
-                            wrapMode: Text.WordWrap
-                            color: "#8b9199"
-                            font.pixelSize: 11
-                            text: clRow.modelData.description
-                        }
-                        Row {
-                            spacing: 6
-                            Button {
-                                text: "✓ Verified"
-                                highlighted: clRow.rowState === "verified"
-                                onClicked: {
-                                    root._setRowState(clRow.modelData, "verified");
-                                    clRow.rowState = "verified";
-                                }
-                            }
-                            Button {
-                                text: "✕ Rejected"
-                                highlighted: clRow.rowState === "rejected"
-                                onClicked: {
-                                    root._setRowState(clRow.modelData, "rejected");
-                                    clRow.rowState = "rejected";
-                                }
-                            }
-                            Button {
-                                property var ctx: root._rowContext(clRow.modelData)
-                                visible: ctx && ctx.objectName ? true : false
-                                text: "⌖"
-                                ToolTip.visible: hovered
-                                ToolTip.text: "Locate in the app"
-                                onClicked: root._locate(clRow.modelData)
-                            }
-                        }
-                        TextArea {
-                            id: issueField
-                            width: parent.width
-                            visible: clRow.rowState === "rejected"
-                            wrapMode: TextArea.Wrap
-                            placeholderText: "What's wrong? (sent to the agent as an issue)"
-                            color: "#e8eaed"
-                            background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
-                            text: clRow.modelData.comment
-                            onTextChanged: {
-                                clRow.modelData.comment = text;
-                                root._updateVerification(clRow.modelData);
-                            }
-                        }
-                        Button {
-                            visible: clRow.rowState === "rejected"
-                            text: root._repinFor === clRow.modelData.id
-                                ? "◎ Click an element…" : "⌖ Re-pin element"
-                            onClicked: root._startRepin(clRow.modelData)
-                        }
-                    }
-                }
-            }
-            // Freeform note (not tied to an element) — mirrors the web composer.
-            TextArea {
-                id: noteField
-                width: parent.width
-                wrapMode: TextArea.Wrap
-                placeholderText: "Add a note… (Ctrl+Enter or click Add)"
-                color: "#e8eaed"
-                background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
-                // Queue the freeform note and clear the field. Shared by the
-                // Ctrl+Enter shortcut and the explicit Add button.
-                function doAdd() {
-                    if (noteField.text.trim().length > 0) {
-                        root.commitNote(noteField.text);
-                        noteField.text = "";
-                    }
-                }
-                Keys.onPressed: ev => {
-                    if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter)
-                            && (ev.modifiers & Qt.ControlModifier)) {
-                        noteField.doAdd();
-                        ev.accepted = true;
-                    }
-                }
-            }
-            // Explicit Add button for the freeform note (twin of the Ctrl+Enter
-            // shortcut), so a note can be queued with the mouse alone.
-            Row {
-                spacing: 8
-                anchors.right: parent.right
-                Button {
-                    text: "Add note"
-                    enabled: noteField.text.trim().length > 0
-                    onClicked: noteField.doAdd()
-                }
-            }
-            Row {
-                spacing: 8
-                Button {
-                    text: "Send " + root.pendingCount + " to agent"
-                    enabled: root.pendingCount > 0
-                    onClicked: root.send()
-                }
-            }
-            Text {
-                id: status
-                visible: root.statusText.length > 0
-                width: parent.width
-                wrapMode: Text.WordWrap
-                font.pixelSize: 12
-                color: root.statusError ? "#ff9d9d" : "#9dffb0"
-                text: root.statusText
-            }
-            // Agent replies — capped height + scrollable so a long reply can't
-            // grow the panel past the window and bury the note composer / Send
-            // button (which live above this in the column).
-            ScrollView {
-                id: msgsScroll
-                width: parent.width
-                visible: msgs.children.length > 0
-                // Cap the viewport; taller content scrolls inside it.
-                height: Math.min(msgs.implicitHeight, 200)
-                clip: true
-                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-
+                // Agent replies (the discussion). The whole body scrolls, so this
+                // needs no scroller of its own.
                 Column {
                     id: msgs
-                    width: msgsScroll.availableWidth
+                    objectName: "annotateMessages"
+                    width: parent.width
+                    visible: children.length > 0 && !root.annotating
                     spacing: 4
                 }
             }

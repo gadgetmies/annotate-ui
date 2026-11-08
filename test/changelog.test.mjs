@@ -141,6 +141,8 @@ test("a kind:verification submit item is delivered by poll and rendered distinct
           selector: ".rating > svg",
           route: "/movie/42",
         },
+        // A sign-off from a newer overlay.
+        { kind: "verification", verdict: "verified", changelogId: "c2", title: "Debounced search", comment: "" },
       ],
     }),
   });
@@ -156,4 +158,9 @@ test("a kind:verification submit item is delivered by poll and rendered distinct
   assert.match(stdout, /verification issue — answers changelog `c1`/);
   assert.match(stdout, /still orange on the detail page/);
   assert.match(stdout, /freeform note \(not tied to a specific element\)/);
+  // The sign-off arrives in the same batch and is listed apart from the issues.
+  const signOff = batch.annotations.find((a) => a.verdict === "verified");
+  assert.equal(signOff.changelogId, "c2");
+  assert.match(stdout, /3 annotation\(s\), 1 verified/);
+  assert.match(stdout, /- Verified: Debounced search \(changelog `c2`\)/);
 });

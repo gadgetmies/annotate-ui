@@ -45,8 +45,13 @@ composer, and SHALL minimise/restore with the panel.
 
 #### Scenario: Marking an entry Verified
 - **WHEN** the user clicks **Verified** on an entry
-- **THEN** the entry is shown as verified, any open reject textbox for that entry is dismissed, and no
-  pending issue is created for it
+- **THEN** the entry is shown as verified, any open reject textbox for that entry is dismissed, and a
+  pending item `kind: "verification"` with `verdict: "verified"`, the entry's `changelogId`, its
+  `title`, an empty comment and the entry's context replaces any earlier item for that entry
+
+#### Scenario: Undoing a verdict
+- **WHEN** the user clicks **Verified** again on a verified entry (or **Undo** on a rejection)
+- **THEN** the entry returns to unset and its pending item is removed
 
 #### Scenario: Checklist shares panel behavior
 - **WHEN** the user minimises the panel to the pill and restores it
@@ -67,24 +72,42 @@ with pending pins.
 
 #### Scenario: Rejection becomes a pending verification issue
 - **WHEN** the user enters an issue description for a rejected entry
-- **THEN** a pending item is queued with `kind: "verification"`, the entry's `changelogId`, the issue
-  comment, and the entry's auto-linked context (when present)
+- **THEN** a pending item is queued with `kind: "verification"`, `verdict: "rejected"`, the entry's
+  `changelogId` and `title`, the issue comment, and the entry's auto-linked context (when present)
+
+#### Scenario: A verification item without a verdict
+- **WHEN** the agent receives a `kind: "verification"` item with no `verdict` field (from an overlay
+  that predates verdicts)
+- **THEN** it is treated as a rejection
 
 #### Scenario: Optional re-pin overrides context
 - **WHEN** the user re-pins an element while a rejection is being described
 - **THEN** the pending verification item carries the freshly pinned element's context (web selector/
   route/source or QML identity) in place of, or in addition to, the entry's auto-linked context
 
-#### Scenario: Un-rejecting removes the pending issue
-- **WHEN** the user switches a rejected entry back to Verified (or clears the rejection)
-- **THEN** the corresponding pending verification item is removed from the queue
+#### Scenario: Switching a rejected entry to Verified
+- **WHEN** the user switches a rejected entry to Verified (or clears the rejection)
+- **THEN** the rejection is removed from the queue (replaced by the verified sign-off when Verified)
 
 ### Requirement: Verification issues are batch-submitted with annotations
 
-Verification issues SHALL join the same pending queue as pins and freeform notes and SHALL be
-submitted by the same **Send** action, so the user can collect verification feedback across the
-checklist first and submit it in one batch. On the wire they SHALL be part of the same
-`/__annotate/submit` `annotations` array, distinguished by `kind: "verification"`.
+Verification items — rejections and verified sign-offs — SHALL join the same pending queue as pins and
+freeform notes and SHALL be submitted by the same **Send** action, so the user can collect verification
+feedback across the checklist first and submit it in one batch. On the wire they SHALL be part of the
+same `/__annotate/submit` `annotations` array, distinguished by `kind: "verification"` and a `verdict`
+of `"verified"` or `"rejected"`. The CLI's markdown summary SHALL list verified items as
+`Verified: <title>` lines separately from the numbered verification issues.
+
+#### Scenario: Sent items leave the checklist
+- **WHEN** a Send that included verification items succeeds
+- **THEN** those entries are removed from the overlay's checklist, entries not in that Send stay, and
+  when no entries are left the checklist section disappears
+
+#### Scenario: Re-delivery after Send (QML overlay)
+- **WHEN** the QML overlay (with the `loadVerdicts`/`saveVerdicts` host hooks, also across an app
+  restart) receives a changelog entry whose verdict was already sent
+- **THEN** the entry stays hidden if its `title`, `description` and `context` are unchanged, and is
+  shown again unset if any of them changed
 
 #### Scenario: Mixed batch submit
 - **WHEN** the pending queue contains any mix of pins, freeform notes, and verification issues and the

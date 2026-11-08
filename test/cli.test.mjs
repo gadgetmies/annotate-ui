@@ -159,6 +159,38 @@ test("formatBatchMarkdown renders a verification issue tied to its changelogId +
   assert.doesNotMatch(md, /freeform note/); // distinct from a note
 });
 
+test("formatBatchMarkdown lists verified items separately from verification issues", () => {
+  const md = formatBatchMarkdown({
+    batchId: 11,
+    annotations: [
+      { kind: "verification", verdict: "rejected", changelogId: "c1", title: "Star gold",
+        comment: "still orange", selector: ".rating" },
+      { kind: "verification", verdict: "verified", changelogId: "c2", title: "Debounced search", comment: "" },
+      { kind: "verification", verdict: "verified", changelogId: "c3", comment: "" }, // no title
+      // No verdict field = a rejection from an older overlay.
+      { kind: "verification", changelogId: "c4", comment: "legacy reject" },
+    ],
+  });
+  assert.match(md, /### 2 annotation\(s\), 2 verified — batch #11/);
+  assert.match(md, /verification issue — answers changelog `c1` "Star gold"/);
+  assert.match(md, /verification issue — answers changelog `c4`/);
+  assert.match(md, /- Verified: Debounced search \(changelog `c2`\)/);
+  assert.match(md, /- Verified: c3 \(changelog `c3`\)/);
+  // Verified items are not numbered as things to act on.
+  assert.doesNotMatch(md, /answers changelog `c2`/);
+  assert.match(md, /\*\*2\. legacy reject\*\*/);
+  assert.ok(md.indexOf("still orange") < md.indexOf("Verified: Debounced"));
+});
+
+test("formatBatchMarkdown with only verified items", () => {
+  const md = formatBatchMarkdown({
+    batchId: 12,
+    annotations: [{ kind: "verification", verdict: "verified", changelogId: "c2", title: "T" }],
+  });
+  assert.match(md, /### 0 annotation\(s\), 1 verified — batch #12/);
+  assert.match(md, /- Verified: T/);
+});
+
 test("validateChangelog accepts well-formed entries and drops unknown fields", () => {
   const out = validateChangelog([
     { id: "c1", title: "T", description: "d", context: { selector: ".x" }, extra: "ignored" },

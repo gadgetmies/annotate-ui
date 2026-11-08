@@ -55,13 +55,17 @@ change, or `source: null`), it omits `context` and the row is display-only until
 **exact field names** from the existing pin payloads means the web overlay's `revealBySelector` and
 the QML overlay's identity capture apply unchanged.
 
-### D3 — A rejection is a pending item `kind: "verification"`, in the shared queue
-Rather than a parallel "verification queue", a rejected entry with a description is pushed onto the
-same `state.pending` array the pins and notes use, as
-`{ kind: "verification", changelogId, comment, ...context }`. This inherits edit/remove, the single
-**Send** (`/__annotate/submit`), the pending-count, and persistence for free. The checklist row and
-its pending item are kept in sync: setting Rejected+description creates/updates the item; switching
-back to Verified (or clearing) removes it (match by `changelogId`). *Alternative considered:* a
+### D3 — A verdict is a pending item `kind: "verification"`, in the shared queue
+Rather than a parallel "verification queue", a verdict is pushed onto the same `state.pending` array
+the pins and notes use, as `{ kind: "verification", verdict, changelogId, title, comment, ...context }`
+— `verdict: "rejected"` with the issue as `comment`, or `verdict: "verified"` with an empty comment.
+This inherits edit/remove, the single **Send** (`/__annotate/submit`), the pending-count, and
+persistence for free. The checklist row and its pending item are kept in sync by `changelogId`: one
+item per entry, replaced on every state change, removed on unset. *Revision:* the first version sent
+nothing for Verified and left the agent to infer it from absence; users then saw verified rows
+linger forever, and the agent could not tell "verified" from "not checked". Verified sign-offs now
+travel with Send, a missing `verdict` still means rejected (older overlays), and a successful Send
+removes the sent entries from the checklist. *Alternative considered:* a
 separate "Send verification" button and batch — rejected per the product decision to keep one unified
 queue and Send (collect-then-batch, as today).
 
@@ -137,6 +141,5 @@ Send/empty.
 
 - Should the overlay surface an explicit "all verified" affordance (e.g. a one-click "Verify all
   remaining") — deferred; per-item is the required behavior.
-- Whether to show a compact **summary line** back to the agent on Send (e.g. "3 verified, 1 rejected")
-  as a note vs. leaving the agent to infer verified items by their absence — leaning toward leaving it
-  to absence for v1 to avoid a synthetic item shape.
+- ~~Whether to report verified items or leave them to absence~~ — resolved (D3 revision): verified
+  items are sent as `verdict: "verified"` sign-offs and summarised as `Verified: <title>` lines.

@@ -42,3 +42,10 @@
 
 - [x] 6.1 Live web pass: `serve` a dev app → `poll --changelog <file>` → checklist appears → Verify some, Reject one (with re-pin) → **Send** → confirm the verification issue arrives via `poll` with `changelogId` + context
 - [ ] 6.2 Live QML pass: `serve --server-only` + a `--annotate` QML app → deliver a changelog → Verify/Reject → **Send** → confirm the `kind:"verification"` item arrives (requires a live desktop session)
+
+## 7. Verified sign-offs and clearing sent items (revision)
+
+- [x] 7.1 Overlays (QML + web): Verified queues `{ kind:"verification", verdict:"verified", changelogId, title, comment:"" , ...context }`; rejections carry `verdict:"rejected"` and `title`
+- [x] 7.2 CLI markdown: list `Verified: <title>` lines apart from the numbered verification issues; an item without `verdict` reads as a rejection
+- [x] 7.3 QML: a successful Send removes the sent entries from the checklist; persisted verdicts keep an unchanged re-delivery hidden and show a changed one unset (also across an app restart); Send label counts sign-offs separately
+- [x] 7.4 Tests: CLI markdown + integration, web helpers, QML verified payload / removal after Send / restart round trip / changed re-delivery

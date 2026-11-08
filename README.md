@@ -105,16 +105,16 @@ After a round of fixes, the agent can deliver a **changelog** — a structured l
 which the overlay renders as a **checklist** in the same panel as your pins. Each row has **Verified**
 and **Rejected** controls:
 
-- **Verified** — the change looks right; nothing is sent back for that item.
+- **Verified** — the change looks right; the sign-off is sent with your next Send.
 - **Rejected** — reveals a textbox to describe what's still wrong. The issue is queued as a pending
   item **already linked to that change's element**, so the agent gets it with context. You can
   optionally **⌖ re-pin** a different element (click it, as when annotating) to correct or add the
   location.
 
-Rejections ride the **same Send** as your pins and notes — collect your sign-off across the whole
+Verdicts ride the **same Send** as your pins and notes — collect your sign-off across the whole
 checklist, then send it all in one batch. On the wire each is a `kind: "verification"` item carrying
-the change's id, your comment, and its element context. Verified items send nothing (the agent infers
-them from the absence of a rejection). The same checklist works in the QML overlay.
+the change's id and title, a `verdict` (`"verified"` or `"rejected"`), your comment for a rejection,
+and its element context. Sent items leave the checklist. The same checklist works in the QML overlay.
 
 The agent drives it with `poll --changelog <file|json>`; you never run anything extra.
 
