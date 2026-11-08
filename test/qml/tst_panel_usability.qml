@@ -136,4 +136,68 @@ TestCase {
         verify(!rowChild("c0", "verifyButton").on);
         verify(!rowChild("c0", "verifiedNote").visible);
     }
+
+    // Rejected opens an issue box; nothing is queued while typing. "Add to
+    // batch" queues a kind:"verification" item (sent with the next Send), the
+    // row then shows the rejection with Edit / Undo.
+    function test_06_rejection_submit_adds_to_batch() {
+        reset();
+        overlay.connected = true;
+        overlay._ingestChangelog([{ id: "r1", title: "Star gold",
+            context: { objectName: "starBtn", qmlType: "Button", qmlFile: "Rating.qml", typeChain: [] } }]);
+        waitForRendering(overlay);
+        mouseClick(rowChild("r1", "rejectButton"));
+        var field = rowChild("r1", "issueField");
+        verify(field.visible, "issue box opens");
+        tryVerify(function () { return field.activeFocus; }, 1000, "issue box focused");
+        var add = rowChild("r1", "addRejectionButton");
+        verify(add.visible);
+        verify(!add.enabled, "nothing to add yet");
+        keyClick("s"); keyClick("t"); keyClick("i"); keyClick("l"); keyClick("l");
+        compare(overlay.pendingCount, 0, "typing does not queue");
+        verify(add.enabled);
+        waitForRendering(overlay);   // typing re-lays out the row
+        mouseClick(add);
+        compare(overlay.pendingCount, 1);
+        var v = overlay._pending[0];
+        compare(v.kind, "verification");
+        compare(v.changelogId, "r1");
+        compare(v.comment, "still");
+        compare(v.objectName, "starBtn");
+        verify(!field.visible, "issue box closes");
+        verify(rowChild("r1", "rejectedSummary").visible);
+        compare(rowChild("r1", "rejectedText").text, "✕ Rejected: still");
+        compare(findChild(overlay, "annotateSend").text, "Send 1 to agent");
+        // Edit + Ctrl+Enter updates the queued item in place.
+        waitForRendering(overlay);
+        mouseClick(rowChild("r1", "editRejectionButton"));
+        verify(field.visible);
+        tryVerify(function () { return field.activeFocus; }, 1000);
+        field.selectAll();
+        keyClick("x");
+        keyClick(Qt.Key_Return, Qt.ControlModifier);
+        compare(overlay.pendingCount, 1);
+        compare(overlay._pending[0].comment, "x");
+        // Undo drops it.
+        waitForRendering(overlay);
+        mouseClick(rowChild("r1", "undoRejectionButton"));
+        compare(overlay.pendingCount, 0);
+        compare(overlay._entryOf("r1").state, "unset");
+    }
+
+    // Cancel on a never-added rejection returns the row to unset, queuing nothing.
+    function test_07_rejection_cancel() {
+        reset();
+        overlay.connected = true;
+        overlay._ingestChangelog([{ id: "r2", title: "x" }]);
+        waitForRendering(overlay);
+        mouseClick(rowChild("r2", "rejectButton"));
+        tryVerify(function () { return rowChild("r2", "issueField").activeFocus; }, 1000);
+        keyClick("n");
+        waitForRendering(overlay);
+        mouseClick(rowChild("r2", "cancelRejectionButton"));
+        compare(overlay.pendingCount, 0);
+        compare(overlay._entryOf("r2").state, "unset");
+        verify(!rowChild("r2", "issueField").visible);
+    }
 }

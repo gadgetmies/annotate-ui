@@ -66,7 +66,10 @@ Item {
     // ---- changelog verification state (in-memory; pending items persist) ----
     // Agent-delivered entries, each augmented with per-row UI state:
     //   { id, title, description, context, state:"unset"|"verified"|"rejected",
-    //     comment, repin }  (repin is a re-pinned identity that overrides context)
+    //     comment, draft, editing, repin }
+    // `comment` is the rejection as added to the batch (what is queued); `draft`
+    // is the issue box's text while `editing`, not queued until submitted.
+    // `repin` is a re-pinned identity that overrides context.
     // The checklist display is best-effort in-memory (mirrors how QML treats other
     // transient UI); only the pending kind:"verification" items are persisted.
     property var _changelog: []
@@ -219,6 +222,8 @@ Item {
                 "context": (e.context && typeof e.context === "object") ? e.context : null,
                 "state": "unset",
                 "comment": "",
+                "draft": "",
+                "editing": false,
                 "repin": null
             });
         }
@@ -287,11 +292,67 @@ Item {
         entry.state = s;
         if (s !== "rejected") {
             entry.comment = "";
+            entry.draft = "";
+            entry.editing = false;
             if (root._repinFor === entry.id)
                 root._repinFor = "";
+        } else {
+            // A rejection without an added issue opens its issue box.
+            entry.editing = String(entry.comment || "").trim().length === 0;
         }
         root._updateVerification(entry);
         root._changelogRev++;
+    }
+    // The Rejected button: opens the issue box on an unset/verified row, and
+    // undoes the rejection (drops its queued item) on a rejected one.
+    function _toggleRejected(id) {
+        var entry = root._entryOf(id);
+        if (entry)
+            root._setRowState(entry, entry.state === "rejected" ? "unset" : "rejected");
+    }
+    // Add (or update) a rejection in the pending batch. Rejections are not
+    // sent on their own: like pins and notes they wait for the panel's Send.
+    function _submitRejection(id, text) {
+        var entry = root._entryOf(id);
+        var t = String(text || "").trim();
+        if (!entry)
+            return false;
+        if (t.length === 0) {
+            root._setStatus("Describe what's wrong before adding the rejection", true);
+            return false;
+        }
+        entry.state = "rejected";
+        entry.comment = t;
+        entry.draft = "";
+        entry.editing = false;
+        root._updateVerification(entry);
+        root._changelogRev++;
+        root._setStatus("Rejection added — it goes to the agent with the next Send", false);
+        return true;
+    }
+    // Reopen an added rejection's issue box (the queued item stays until a new
+    // text is submitted or the rejection is undone).
+    function _editRejection(id) {
+        var entry = root._entryOf(id);
+        if (!entry)
+            return;
+        entry.draft = entry.comment;
+        entry.editing = true;
+        root._changelogRev++;
+    }
+    // Close the issue box without submitting: an added rejection keeps its
+    // queued text; a rejection never added goes back to unset.
+    function _cancelRejection(id) {
+        var entry = root._entryOf(id);
+        if (!entry)
+            return;
+        if (String(entry.comment || "").trim().length > 0) {
+            entry.draft = "";
+            entry.editing = false;
+            root._changelogRev++;
+        } else {
+            root._setRowState(entry, "unset");
+        }
     }
     // Verified is a toggle: a second click returns the row to unset.
     function _toggleVerified(id) {
@@ -304,8 +365,10 @@ Item {
         var entry = root._entryOf(entryOrId);
         if (!entry)
             return;
-        if (entry.state !== "rejected")
+        if (entry.state !== "rejected") {
             entry.state = "rejected";
+            entry.editing = true;
+        }
         root._changelogRev++;
         root._repinFor = entry.id;
         root.annotating = true;
@@ -986,6 +1049,11 @@ Item {
                             readonly property string entryId: modelData.id
                             readonly property string rowState: root._rowField(entryId, "state") || "unset"
                             readonly property bool verified: rowState === "verified"
+                            readonly property bool editing: rowState === "rejected"
+                                && (root._rowField(entryId, "editing") === true)
+                            readonly property string savedComment: root._rowField(entryId, "comment") || ""
+                            // Opening the issue box puts the cursor in it.
+                            onEditingChanged: if (editing) issueField.forceActiveFocus()
                             Rectangle { width: parent.width; height: 1; color: "#1c1f25" }
                             Text {
                                 width: parent.width
@@ -1020,7 +1088,9 @@ Item {
                                     onColor: "#5a2530"
                                     onBorder: "#8a3b48"
                                     onText: "#ffd6dc"
-                                    onClicked: root._setRowState(clRow.entryId, "rejected")
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: clRow.rowState === "rejected" ? "Click to undo the rejection" : "It's wrong — describe the issue"
+                                    onClicked: root._toggleRejected(clRow.entryId)
                                 }
                                 RowToggle {
                                     property var ctx: { root._changelogRev; return root._rowContext(root._entryOf(clRow.entryId) || {}); }
@@ -1040,21 +1110,90 @@ Item {
                                 font.pixelSize: 11
                                 text: "Verified — nothing is sent to the agent for this item."
                             }
+                            // Issue box (while editing): nothing is queued until
+                            // "Add to batch" or Ctrl/⌘+Enter; Cancel / Esc closes it.
                             TextArea {
                                 id: issueField
+                                objectName: "issueField"
                                 width: parent.width
-                                visible: clRow.rowState === "rejected"
+                                visible: clRow.editing
                                 wrapMode: TextArea.Wrap
-                                placeholderText: "What's wrong? (sent to the agent as an issue)"
+                                textFormat: TextEdit.PlainText
+                                placeholderText: "What's wrong? (Ctrl/⌘+Enter adds it to the batch)"
                                 color: "#e8eaed"
-                                background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
-                                text: root._rowField(clRow.entryId, "comment") || ""
+                                background: Rectangle { color: "#0e1013"; border.color: "#8a3b48"; radius: 6 }
+                                text: root._rowField(clRow.entryId, "draft") || ""
                                 onTextChanged: {
                                     var e = root._entryOf(clRow.entryId);
-                                    if (!e || e.comment === text)
-                                        return;
-                                    e.comment = text;
-                                    root._updateVerification(e);
+                                    if (e)
+                                        e.draft = text;   // a draft, not queued
+                                }
+                                Keys.onPressed: ev => {
+                                    if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter)
+                                            && (ev.modifiers & (Qt.ControlModifier | Qt.MetaModifier))) {
+                                        root._submitRejection(clRow.entryId, issueField.text);
+                                        ev.accepted = true;
+                                    } else if (ev.key === Qt.Key_Escape) {
+                                        root._cancelRejection(clRow.entryId);
+                                        ev.accepted = true;
+                                    }
+                                }
+                            }
+                            Row {
+                                visible: clRow.editing
+                                spacing: 6
+                                anchors.right: parent.right
+                                RowToggle {
+                                    objectName: "cancelRejectionButton"
+                                    text: "Cancel"
+                                    onClicked: root._cancelRejection(clRow.entryId)
+                                }
+                                RowToggle {
+                                    objectName: "addRejectionButton"
+                                    text: clRow.savedComment.length > 0 ? "Update rejection" : "Add to batch"
+                                    on: issueField.text.trim().length > 0
+                                    enabled: issueField.text.trim().length > 0
+                                    onColor: "#2b5fd0"
+                                    onBorder: "#2b5fd0"
+                                    onText: "#ffffff"
+                                    onClicked: root._submitRejection(clRow.entryId, issueField.text)
+                                }
+                            }
+                            // Added rejection: what will be sent, with Edit / Undo.
+                            Column {
+                                objectName: "rejectedSummary"
+                                width: parent.width
+                                spacing: 4
+                                visible: clRow.rowState === "rejected" && !clRow.editing
+                                         && clRow.savedComment.length > 0
+                                Text {
+                                    objectName: "rejectedText"
+                                    width: parent.width
+                                    wrapMode: Text.WordWrap
+                                    textFormat: Text.PlainText
+                                    color: "#ffb3be"
+                                    font.pixelSize: 12
+                                    text: "✕ Rejected: " + clRow.savedComment
+                                }
+                                Text {
+                                    width: parent.width
+                                    wrapMode: Text.WordWrap
+                                    color: "#8b9199"
+                                    font.pixelSize: 11
+                                    text: "In the batch — goes to the agent with the next Send."
+                                }
+                                Row {
+                                    spacing: 6
+                                    RowToggle {
+                                        objectName: "editRejectionButton"
+                                        text: "Edit"
+                                        onClicked: root._editRejection(clRow.entryId)
+                                    }
+                                    RowToggle {
+                                        objectName: "undoRejectionButton"
+                                        text: "Undo"
+                                        onClicked: root._setRowState(clRow.entryId, "unset")
+                                    }
                                 }
                             }
                             Button {

@@ -99,8 +99,10 @@ The agent delivers the changelog (via `annotate-ui poll --changelog`) as a **typ
 
 The overlay branches on `type`: a `"changelog"` message becomes the checklist; a plain reply (no
 `type`) is shown as a message line; an **unknown `type` is ignored** without error. When the user
-**Rejects** a row and describes the issue, the overlay queues a verification item into the same
-pending array it POSTs to `/__annotate/submit`:
+**Rejects** a row, describes the issue and clicks **Add to batch** (or presses Ctrl/⌘+Enter), the
+overlay queues a verification item into the same pending array it POSTs to `/__annotate/submit`
+(typing alone queues nothing; Cancel/Esc closes the box; an added rejection shows on its row with
+**Edit** / **Undo**). It is sent with the panel's next **Send**, never on its own:
 
     { "surface": "qml", "kind": "verification",
       "changelogId": "c1", "comment": "still orange after the fix",

@@ -119,7 +119,9 @@ The changelog is a JSON array of entries `{ id, title, description?, context? }`
 **The overlay** (web and QML) renders the changelog as a checklist in the same panel as the pins:
 each row has **Verified** / **Rejected** controls. Verified needs nothing from you. **Rejected**
 opens a textbox for the issue and (optionally) lets the user **re-pin** a different element to correct
-the location — exactly the point-and-click of a normal annotation.
+the location — exactly the point-and-click of a normal annotation. Rejections join the pending batch
+and reach you with the user's next **Send** (in the QML overlay the user adds each one with **Add to
+batch** or Ctrl/⌘+Enter; the web overlay queues it as they type).
 
 **You receive rejections** through the **same `poll`** as everything else — no second command. A
 rejection arrives in the batch as an item with `kind: "verification"`, carrying the `changelogId` it
