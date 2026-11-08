@@ -23,6 +23,18 @@ Qt Quick app (C++ **or** Python) and for what it emits.
    The overlay guards both with `typeof`, so it still loads if a host forgets one —
    but set both for a clean integration.
 
+3. **Don't change the overlay root's pointer handling.** Parented into `contentItem` at
+   its high `z`, the root covers the whole window *above* the popup layer
+   (`Overlay.overlay`). While a modal popup is open, Qt Quick Controls drops every wheel
+   event whose top item under the pointer lies outside that popup, and it judges "under
+   the pointer" by geometry alone, painted or not. A plain full-window root would
+   therefore make every modal dialog in the app impossible to scroll while the overlay
+   is installed. The overlay gives its root an empty `containmentMask`, so the root
+   itself is never hit and only its children (the pill, the panel, the capture layer
+   while annotating) take input. Keep that, don't wrap the overlay in another
+   full-window item, and don't replace the mask from the host. Harmonia hit this in its
+   "Report a problem" dialog; `test/qml/tst_modal_wheel.qml` guards it.
+
 ### Optional `annotateHost` methods
 
 All are optional; implement any subset. If a hook is absent the overlay degrades
