@@ -737,6 +737,7 @@ Item {
 
     Rectangle {
         id: panel
+        objectName: "annotatePanel"
         z: 6
         // Shown while annotating OR disconnected (so the recovery UI is reachable)
         // OR whenever a verification checklist is present (so the user can sign off
@@ -750,29 +751,47 @@ Item {
         radius: 10
         color: "#14161b"
         border.color: "#3a3f47"
-        implicitHeight: pcol.implicitHeight + 20
-        height: implicitHeight
+        // Never taller than the window: the room above the pill, less a top
+        // margin. The header stays put; the body scrolls inside what is left.
+        readonly property real maxHeight: Math.max(120, pill.y - anchors.bottomMargin - 16)
+        implicitHeight: 10 + header.height + 8 + pcol.implicitHeight + 10
+        height: Math.min(implicitHeight, maxHeight)
 
-        Column {
-            id: pcol
-            anchors.fill: parent
+        // Header: title/count, annotate toggle and a "–" minimise button
+        // (collapses to the pill). Outside the scrolling body so it is always
+        // reachable however long the checklist or the discussion gets.
+        Item {
+            id: header
+            objectName: "annotatePanelHeader"
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
             anchors.margins: 10
-            spacing: 8
-            // Header: title/count + a "–" minimise button (collapses to the pill).
-            Item {
-                width: parent.width
-                height: minBtn.implicitHeight
-                Text {
-                    anchors.left: parent.left
+            height: minBtn.implicitHeight
+            Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                color: "#9aa0a6"
+                font.pixelSize: 12
+                font.bold: true
+                text: "Annotations (" + root.pendingCount + ")"
+            }
+            Row {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 2
+                Button {
+                    objectName: "annotateHeaderToggle"
                     anchors.verticalCenter: parent.verticalCenter
-                    color: "#9aa0a6"
+                    flat: true
+                    padding: 4
                     font.pixelSize: 12
-                    font.bold: true
-                    text: "Annotations (" + root.pendingCount + ")"
+                    text: root.annotating ? "Stop annotating" : "✎ Annotate"
+                    onClicked: root.requestAnnotate()
                 }
                 Button {
                     id: minBtn
-                    anchors.right: parent.right
+                    objectName: "annotateMinimise"
                     anchors.verticalCenter: parent.verticalCenter
                     flat: true
                     padding: 2
@@ -783,215 +802,236 @@ Item {
                     onClicked: root.minimized = true
                 }
             }
-            Text {
-                width: parent.width
-                wrapMode: Text.WordWrap
-                color: "#6b7178"
-                font.pixelSize: 11
-                text: root.hasServer()
-                    ? "Alt/⌥-click to use the app (open menus/popups), then click to annotate."
-                    : "No annotate-ui server — run `annotate-ui serve --server-only`, then reopen."
+        }
+
+        // Scrolling body: everything below the header. Wheel and drag scroll it;
+        // the bar is shown whenever the content overflows.
+        Flickable {
+            id: body
+            objectName: "annotatePanelBody"
+            anchors.top: header.bottom
+            anchors.topMargin: 8
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: 10
+            anchors.rightMargin: 10
+            anchors.bottomMargin: 10
+            clip: true
+            contentWidth: width
+            contentHeight: pcol.implicitHeight
+            flickableDirection: Flickable.VerticalFlick
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {
+                objectName: "annotatePanelScrollBar"
+                policy: body.contentHeight > body.height ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
             }
-            // Connection status + recover a wrong/unset server URL WITHOUT
-            // relaunching — so queued pins are never lost to a bad URL.
+
             Column {
-                width: parent.width
-                spacing: 6
-                visible: !root.connected
+                id: pcol
+                width: body.width - 10   // room for the scroll bar
+                spacing: 8
                 Text {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    color: "#ffcf8f"
+                    color: "#6b7178"
                     font.pixelSize: 11
-                    text: root.checking
-                        ? "Connecting…"
-                        : ("Not connected."
-                           + (root.pendingCount > 0
-                              ? (" " + root.pendingCount + " pin(s) kept safe — fix the URL, then Send.")
-                              : " Set the callback URL, then annotate."))
+                    text: root.hasServer()
+                        ? "Alt/⌥-click to use the app (open menus/popups), then click to annotate."
+                        : "No annotate-ui server — run `annotate-ui serve --server-only`, then reopen."
                 }
-                TextField {
-                    id: urlField
+                // Connection status + recover a wrong/unset server URL WITHOUT
+                // relaunching — so queued pins are never lost to a bad URL.
+                Column {
                     width: parent.width
-                    text: root.serverUrl
-                    placeholderText: "http://127.0.0.1:6100"
+                    spacing: 6
+                    visible: !root.connected
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        color: "#ffcf8f"
+                        font.pixelSize: 11
+                        text: root.checking
+                            ? "Connecting…"
+                            : ("Not connected."
+                               + (root.pendingCount > 0
+                                  ? (" " + root.pendingCount + " pin(s) kept safe — fix the URL, then Send.")
+                                  : " Set the callback URL, then annotate."))
+                    }
+                    TextField {
+                        id: urlField
+                        width: parent.width
+                        text: root.serverUrl
+                        placeholderText: "http://127.0.0.1:6100"
+                        color: "#e8eaed"
+                        background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
+                        onAccepted: connectBtn.doConnect()
+                    }
+                    Button {
+                        id: connectBtn
+                        anchors.right: parent.right
+                        text: root.checking ? "Checking…" : "Connect"
+                        enabled: !root.checking
+                        function doConnect() {
+                            root.serverUrlOverride = urlField.text.trim();
+                            root.checkConnection(function (ok) {
+                                root._setStatus(ok ? "Connected ✓" : "Still can't reach that URL.", !ok);
+                            });
+                        }
+                        onClicked: doConnect()
+                    }
+                }
+                // Verification checklist — one row per agent-delivered changelog entry,
+                // mirroring the web overlay. Renders all user/agent strings via `Text`
+                // only (never as markup).
+                Column {
+                    id: checklist
+                    width: parent.width
+                    spacing: 6
+                    visible: root._changelog.length > 0
+                    Text {
+                        width: parent.width
+                        color: "#9aa0a6"
+                        font.pixelSize: 11
+                        font.bold: true
+                        text: "Changelog — verify each change"
+                    }
+                    Repeater {
+                        model: root._changelog
+                        delegate: Column {
+                            id: clRow
+                            width: checklist.width
+                            spacing: 4
+                            required property var modelData
+                            // Local mirror of the entry's state: mutating the plain JS
+                            // entry can't notify bindings, so the click handlers set
+                            // this explicitly to drive the row's reactive UI.
+                            property string rowState: modelData.state
+                            Rectangle { width: parent.width; height: 1; color: "#1c1f25" }
+                            Text {
+                                width: parent.width
+                                wrapMode: Text.WordWrap
+                                color: "#e8eaed"
+                                font.pixelSize: 13
+                                text: clRow.modelData.title
+                            }
+                            Text {
+                                width: parent.width
+                                visible: clRow.modelData.description.length > 0
+                                wrapMode: Text.WordWrap
+                                color: "#8b9199"
+                                font.pixelSize: 11
+                                text: clRow.modelData.description
+                            }
+                            Row {
+                                spacing: 6
+                                Button {
+                                    text: "✓ Verified"
+                                    highlighted: clRow.rowState === "verified"
+                                    onClicked: {
+                                        root._setRowState(clRow.modelData, "verified");
+                                        clRow.rowState = "verified";
+                                    }
+                                }
+                                Button {
+                                    text: "✕ Rejected"
+                                    highlighted: clRow.rowState === "rejected"
+                                    onClicked: {
+                                        root._setRowState(clRow.modelData, "rejected");
+                                        clRow.rowState = "rejected";
+                                    }
+                                }
+                                Button {
+                                    property var ctx: root._rowContext(clRow.modelData)
+                                    visible: ctx && ctx.objectName ? true : false
+                                    text: "⌖"
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: "Locate in the app"
+                                    onClicked: root._locate(clRow.modelData)
+                                }
+                            }
+                            TextArea {
+                                id: issueField
+                                width: parent.width
+                                visible: clRow.rowState === "rejected"
+                                wrapMode: TextArea.Wrap
+                                placeholderText: "What's wrong? (sent to the agent as an issue)"
+                                color: "#e8eaed"
+                                background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
+                                text: clRow.modelData.comment
+                                onTextChanged: {
+                                    clRow.modelData.comment = text;
+                                    root._updateVerification(clRow.modelData);
+                                }
+                            }
+                            Button {
+                                visible: clRow.rowState === "rejected"
+                                text: root._repinFor === clRow.modelData.id
+                                    ? "◎ Click an element…" : "⌖ Re-pin element"
+                                onClicked: root._startRepin(clRow.modelData)
+                            }
+                        }
+                    }
+                }
+                // Freeform note (not tied to an element) — mirrors the web composer.
+                TextArea {
+                    id: noteField
+                    width: parent.width
+                    wrapMode: TextArea.Wrap
+                    placeholderText: "Add a note… (Ctrl+Enter or click Add)"
                     color: "#e8eaed"
                     background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
-                    onAccepted: connectBtn.doConnect()
+                    // Queue the freeform note and clear the field. Shared by the
+                    // Ctrl+Enter shortcut and the explicit Add button.
+                    function doAdd() {
+                        if (noteField.text.trim().length > 0) {
+                            root.commitNote(noteField.text);
+                            noteField.text = "";
+                        }
+                    }
+                    Keys.onPressed: ev => {
+                        if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter)
+                                && (ev.modifiers & Qt.ControlModifier)) {
+                            noteField.doAdd();
+                            ev.accepted = true;
+                        }
+                    }
                 }
-                Button {
-                    id: connectBtn
+                // Explicit Add button for the freeform note (twin of the Ctrl+Enter
+                // shortcut), so a note can be queued with the mouse alone.
+                Row {
+                    spacing: 8
                     anchors.right: parent.right
-                    text: root.checking ? "Checking…" : "Connect"
-                    enabled: !root.checking
-                    function doConnect() {
-                        root.serverUrlOverride = urlField.text.trim();
-                        root.checkConnection(function (ok) {
-                            root._setStatus(ok ? "Connected ✓" : "Still can't reach that URL.", !ok);
-                        });
+                    Button {
+                        text: "Add note"
+                        enabled: noteField.text.trim().length > 0
+                        onClicked: noteField.doAdd()
                     }
-                    onClicked: doConnect()
                 }
-            }
-            // Verification checklist — one row per agent-delivered changelog entry,
-            // mirroring the web overlay. Renders all user/agent strings via `Text`
-            // only (never as markup).
-            Column {
-                id: checklist
-                width: parent.width
-                spacing: 6
-                visible: root._changelog.length > 0
+                Row {
+                    spacing: 8
+                    Button {
+                        text: "Send " + root.pendingCount + " to agent"
+                        enabled: root.pendingCount > 0
+                        onClicked: root.send()
+                    }
+                }
                 Text {
+                    id: status
+                    visible: root.statusText.length > 0
                     width: parent.width
-                    color: "#9aa0a6"
-                    font.pixelSize: 11
-                    font.bold: true
-                    text: "Changelog — verify each change"
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: 12
+                    color: root.statusError ? "#ff9d9d" : "#9dffb0"
+                    text: root.statusText
                 }
-                Repeater {
-                    model: root._changelog
-                    delegate: Column {
-                        id: clRow
-                        width: checklist.width
-                        spacing: 4
-                        required property var modelData
-                        // Local mirror of the entry's state: mutating the plain JS
-                        // entry can't notify bindings, so the click handlers set
-                        // this explicitly to drive the row's reactive UI.
-                        property string rowState: modelData.state
-                        Rectangle { width: parent.width; height: 1; color: "#1c1f25" }
-                        Text {
-                            width: parent.width
-                            wrapMode: Text.WordWrap
-                            color: "#e8eaed"
-                            font.pixelSize: 13
-                            text: clRow.modelData.title
-                        }
-                        Text {
-                            width: parent.width
-                            visible: clRow.modelData.description.length > 0
-                            wrapMode: Text.WordWrap
-                            color: "#8b9199"
-                            font.pixelSize: 11
-                            text: clRow.modelData.description
-                        }
-                        Row {
-                            spacing: 6
-                            Button {
-                                text: "✓ Verified"
-                                highlighted: clRow.rowState === "verified"
-                                onClicked: {
-                                    root._setRowState(clRow.modelData, "verified");
-                                    clRow.rowState = "verified";
-                                }
-                            }
-                            Button {
-                                text: "✕ Rejected"
-                                highlighted: clRow.rowState === "rejected"
-                                onClicked: {
-                                    root._setRowState(clRow.modelData, "rejected");
-                                    clRow.rowState = "rejected";
-                                }
-                            }
-                            Button {
-                                property var ctx: root._rowContext(clRow.modelData)
-                                visible: ctx && ctx.objectName ? true : false
-                                text: "⌖"
-                                ToolTip.visible: hovered
-                                ToolTip.text: "Locate in the app"
-                                onClicked: root._locate(clRow.modelData)
-                            }
-                        }
-                        TextArea {
-                            id: issueField
-                            width: parent.width
-                            visible: clRow.rowState === "rejected"
-                            wrapMode: TextArea.Wrap
-                            placeholderText: "What's wrong? (sent to the agent as an issue)"
-                            color: "#e8eaed"
-                            background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
-                            text: clRow.modelData.comment
-                            onTextChanged: {
-                                clRow.modelData.comment = text;
-                                root._updateVerification(clRow.modelData);
-                            }
-                        }
-                        Button {
-                            visible: clRow.rowState === "rejected"
-                            text: root._repinFor === clRow.modelData.id
-                                ? "◎ Click an element…" : "⌖ Re-pin element"
-                            onClicked: root._startRepin(clRow.modelData)
-                        }
-                    }
-                }
-            }
-            // Freeform note (not tied to an element) — mirrors the web composer.
-            TextArea {
-                id: noteField
-                width: parent.width
-                wrapMode: TextArea.Wrap
-                placeholderText: "Add a note… (Ctrl+Enter or click Add)"
-                color: "#e8eaed"
-                background: Rectangle { color: "#0e1013"; border.color: "#3a3f47"; radius: 6 }
-                // Queue the freeform note and clear the field. Shared by the
-                // Ctrl+Enter shortcut and the explicit Add button.
-                function doAdd() {
-                    if (noteField.text.trim().length > 0) {
-                        root.commitNote(noteField.text);
-                        noteField.text = "";
-                    }
-                }
-                Keys.onPressed: ev => {
-                    if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter)
-                            && (ev.modifiers & Qt.ControlModifier)) {
-                        noteField.doAdd();
-                        ev.accepted = true;
-                    }
-                }
-            }
-            // Explicit Add button for the freeform note (twin of the Ctrl+Enter
-            // shortcut), so a note can be queued with the mouse alone.
-            Row {
-                spacing: 8
-                anchors.right: parent.right
-                Button {
-                    text: "Add note"
-                    enabled: noteField.text.trim().length > 0
-                    onClicked: noteField.doAdd()
-                }
-            }
-            Row {
-                spacing: 8
-                Button {
-                    text: "Send " + root.pendingCount + " to agent"
-                    enabled: root.pendingCount > 0
-                    onClicked: root.send()
-                }
-            }
-            Text {
-                id: status
-                visible: root.statusText.length > 0
-                width: parent.width
-                wrapMode: Text.WordWrap
-                font.pixelSize: 12
-                color: root.statusError ? "#ff9d9d" : "#9dffb0"
-                text: root.statusText
-            }
-            // Agent replies — capped height + scrollable so a long reply can't
-            // grow the panel past the window and bury the note composer / Send
-            // button (which live above this in the column).
-            ScrollView {
-                id: msgsScroll
-                width: parent.width
-                visible: msgs.children.length > 0
-                // Cap the viewport; taller content scrolls inside it.
-                height: Math.min(msgs.implicitHeight, 200)
-                clip: true
-                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-
+                // Agent replies (the discussion). The whole body scrolls, so this
+                // needs no scroller of its own.
                 Column {
                     id: msgs
-                    width: msgsScroll.availableWidth
+                    objectName: "annotateMessages"
+                    width: parent.width
+                    visible: children.length > 0
                     spacing: 4
                 }
             }
