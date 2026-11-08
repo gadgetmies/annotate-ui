@@ -28,6 +28,15 @@ Item {
     objectName: "annotateOverlayRoot"
     anchors.fill: parent
     z: 2000000
+    // The root covers the whole window above the popup layer, but must not
+    // count as "the item under the pointer" itself: while a modal popup is
+    // open, Qt Quick Controls drops every wheel event whose top item lies
+    // outside the popup, judged by geometry alone. A mask containing nothing
+    // takes the root out of hit-testing; its children (pill, panel, the
+    // capture layer while annotating) still get their input.
+    containmentMask: QtObject {
+        function contains(point: point): bool { return false }
+    }
 
     property bool annotating: false
     // Minimise the panel to just the bottom-left pill so you can annotate
