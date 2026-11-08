@@ -657,10 +657,23 @@ function httpJson(method, url, body) {
   });
 }
 
+// A verification item the user signed off as working. A verification item
+// with no `verdict` is a rejection (the shape before verdicts existed).
+export function isVerifiedItem(a) {
+  return !!a && a.kind === "verification" && a.verdict === "verified";
+}
+
 export function formatBatchMarkdown(batch) {
   if (!batch || !batch.annotations || !batch.annotations.length) return "";
-  const lines = [`### ${batch.annotations.length} annotation(s) — batch #${batch.batchId}`, ""];
-  batch.annotations.forEach((a, i) => {
+  // Verified sign-offs are listed on their own after the numbered items, so
+  // the numbered list stays "things to act on".
+  const verified = batch.annotations.filter(isVerifiedItem);
+  const items = batch.annotations.filter((a) => !isVerifiedItem(a));
+  const head = verified.length
+    ? `### ${items.length} annotation(s), ${verified.length} verified — batch #${batch.batchId}`
+    : `### ${items.length} annotation(s) — batch #${batch.batchId}`;
+  const lines = [head, ""];
+  items.forEach((a, i) => {
     lines.push(`**${i + 1}. ${a.comment || "(no comment)"}**`);
     if (a.kind === "note") {
       lines.push(`- freeform note (not tied to a specific element)`);
@@ -671,7 +684,7 @@ export function formatBatchMarkdown(batch) {
     // it reads as sign-off feedback, distinct from a fresh pin, then fall through
     // to its (auto-linked or re-pinned) element context below.
     if (a.kind === "verification") {
-      lines.push(`- verification issue — answers changelog \`${a.changelogId ?? "?"}\``);
+      lines.push(`- verification issue — answers changelog \`${a.changelogId ?? "?"}\`${a.title ? ` "${a.title}"` : ""}`);
     }
     if (a.source && a.source.file) {
       lines.push(`- source: \`${a.source.file}:${a.source.line}\`${a.source.component ? ` (<${a.source.component}>)` : ""}`);
@@ -686,6 +699,13 @@ export function formatBatchMarkdown(batch) {
     if (a.outerHTML) lines.push(`- html: \`${a.outerHTML}\``);
     lines.push("");
   });
+  if (verified.length) {
+    lines.push(`**Verified by the user (${verified.length}) — no action needed:**`);
+    for (const v of verified) {
+      lines.push(`- Verified: ${v.title || v.changelogId || "?"} (changelog \`${v.changelogId ?? "?"}\`)`);
+    }
+    lines.push("");
+  }
   return lines.join("\n");
 }
 

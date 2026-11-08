@@ -239,6 +239,8 @@ Item {
             };
             entry.hash = root._entryHash(entry);
             root._applyVerdict(entry);
+            if (entry.sent)
+                continue;   // its verdict already reached the agent: stay hidden
             next.push(entry);
         }
         root._changelog = next;
@@ -300,7 +302,7 @@ Item {
                 "hash": entry.hash || root._entryHash(entry),
                 "state": entry.state,
                 "comment": entry.state === "rejected" ? comment : "",
-                "sent": entry.state === "rejected" && entry.sent === true,
+                "sent": entry.sent === true,
                 "at": Date.now()
             };
         }
@@ -328,17 +330,6 @@ Item {
                 root._verdicts = obj;
         } catch (e) { /* corrupt/absent → start empty */ }
     }
-    // Rows the user still has to act on (unset, or a rejection not yet sent).
-    function _openRowCount() {
-        var rev = root._changelogRev;   // dependency only
-        var n = 0;
-        for (var i = 0; i < root._changelog.length; ++i) {
-            var e = root._changelog[i];
-            if (!(e.state === "verified" || (e.state === "rejected" && e.sent)))
-                n++;
-        }
-        return n;
-    }
     // The live entry for a changelogId (or for an entry-like object, by its id).
     // Delegates must go through this: a Repeater over a JS array hands each
     // delegate a *copy* of its element as `modelData`, so writing to modelData
@@ -363,7 +354,8 @@ Item {
         return entry.repin || entry.context || null;
     }
     // Sync the shared pending queue to a row's state: drop any verification item
-    // for this changelogId, then re-add it when the row is a non-empty rejection.
+    // for this changelogId, then re-add it when the row is verified or a
+    // non-empty rejection.
     // Matched by changelogId so a row and its queued issue can never drift.
     function _updateVerification(entry) {
         var id = entry.id;
@@ -374,13 +366,18 @@ Item {
                 next.push(p);
         }
         var comment = String(entry.comment || "").trim();
-        if (entry.state === "rejected" && comment.length > 0) {
+        var rejected = entry.state === "rejected" && comment.length > 0;
+        // A verdict goes to the agent with the next Send: a rejection with its
+        // comment, or a sign-off that the change works.
+        if (rejected || entry.state === "verified") {
             var ctx = root._rowContext(entry) || {};
             next.push({
                 "surface": "qml",
                 "kind": "verification",
+                "verdict": rejected ? "rejected" : "verified",
                 "changelogId": id,
-                "comment": comment,
+                "title": entry.title || "",
+                "comment": rejected ? comment : "",
                 "objectName": ctx.objectName || "",
                 "qmlType": ctx.qmlType || "",
                 "qmlFile": ctx.qmlFile || "",
@@ -601,24 +598,45 @@ Item {
         root._pending = [];
         root.pendingCount = 0;
         root._persist();          // clears the on-disk queue too
-        // Rejections in this batch are now with the agent: remember them
-        // as sent, so a restart shows them collapsed, not unset.
+        // The verdicts in this batch are now with the agent: remember them as
+        // sent (an unchanged re-delivery stays hidden, also after a restart)
+        // and take those rows off the checklist. Rows not in the batch stay.
         var nv = {};
         for (var k in root._verdicts)
             nv[k] = root._verdicts[k];
+        var sentIds = {};
         for (var b = 0; b < batch.length; ++b) {
             var it = batch[b];
-            var v = (it && it.kind === "verification") ? nv[it.changelogId] : null;
-            if (v && v.state === "rejected")
-                nv[it.changelogId] = { "hash": v.hash, "state": "rejected",
+            if (!(it && it.kind === "verification"))
+                continue;
+            sentIds[it.changelogId] = true;
+            var v = nv[it.changelogId];
+            if (v)
+                nv[it.changelogId] = { "hash": v.hash, "state": v.state,
                     "comment": v.comment, "sent": true, "at": Date.now() };
         }
         root._verdicts = nv;
         root._saveVerdicts();
-        root._changelog = [];     // the verification round went with it
+        root._changelog = root._changelog.filter(function (e) { return !sentIds[e.id]; });
         root._repinFor = "";
         root.connected = true;
         root._setStatus("Sent to agent ✓", false);
+    }
+    // "Send 3 to agent", or with sign-offs split out: "Send 1 · 2 verified to agent".
+    function _sendLabel() {
+        var v = 0;
+        for (var i = 0; i < root._pending.length; ++i) {
+            var p = root._pending[i];
+            if (p && p.kind === "verification" && p.verdict === "verified")
+                v++;
+        }
+        var n = root.pendingCount - v;
+        var parts = [];
+        if (n > 0 || v === 0)
+            parts.push(String(n));
+        if (v > 0)
+            parts.push(v + " verified");
+        return "Send " + parts.join(" · ") + " to agent";
     }
     function send() {
         if (!root._pending.length)
@@ -1016,9 +1034,7 @@ Item {
         // Shown while annotating OR disconnected (so the recovery UI is reachable)
         // OR whenever a verification checklist is present (so the user can sign off
         // on it without first entering annotate mode).
-        // A checklist whose rows all have a verdict (verified / rejection sent)
-        // does not pop the panel open by itself, e.g. after a restart.
-        visible: (root.annotating || !root.connected || root._openRowCount() > 0) && !root.minimized
+        visible: (root.annotating || !root.connected || root._changelog.length > 0) && !root.minimized
         anchors.left: parent.left
         anchors.bottom: pill.top
         anchors.leftMargin: 16
@@ -1211,11 +1227,6 @@ Item {
                             readonly property string entryId: modelData.id
                             readonly property string rowState: root._rowField(entryId, "state") || "unset"
                             readonly property bool verified: rowState === "verified"
-                            // A rejection already sent to the agent: shown collapsed,
-                            // no controls, until the agent re-delivers it changed.
-                            readonly property bool sentRejection: rowState === "rejected"
-                                && root._rowField(entryId, "sent") === true
-                            readonly property bool collapsed: verified || sentRejection
                             readonly property bool editing: rowState === "rejected"
                                 && (root._rowField(entryId, "editing") === true)
                             readonly property string savedComment: root._rowField(entryId, "comment") || ""
@@ -1225,28 +1236,27 @@ Item {
                             Text {
                                 width: parent.width
                                 wrapMode: Text.WordWrap
-                                color: clRow.verified ? "#9dffb0" : (clRow.sentRejection ? "#ffb3be" : "#e8eaed")
-                                opacity: clRow.collapsed ? 0.75 : 1
+                                color: clRow.verified ? "#9dffb0" : "#e8eaed"
+                                opacity: clRow.verified ? 0.75 : 1
                                 font.pixelSize: 13
-                                text: (clRow.verified ? "✓ " : (clRow.sentRejection ? "✕ " : "")) + clRow.modelData.title
+                                text: (clRow.verified ? "✓ " : "") + clRow.modelData.title
                             }
                             Text {
                                 width: parent.width
-                                visible: !clRow.collapsed && clRow.modelData.description.length > 0
+                                visible: !clRow.verified && clRow.modelData.description.length > 0
                                 wrapMode: Text.WordWrap
                                 color: "#8b9199"
                                 font.pixelSize: 11
                                 text: clRow.modelData.description
                             }
                             Row {
-                                visible: !clRow.sentRejection
                                 spacing: 6
                                 RowToggle {
                                     objectName: "verifyButton"
                                     text: clRow.verified ? "✓ Verified" : "Verified"
                                     on: clRow.verified
                                     ToolTip.visible: hovered
-                                    ToolTip.text: clRow.verified ? "Click to undo" : "It works — nothing is sent"
+                                    ToolTip.text: clRow.verified ? "Click to undo" : "It works"
                                     onClicked: root._toggleVerified(clRow.entryId)
                                 }
                                 RowToggle {
@@ -1276,16 +1286,7 @@ Item {
                                 wrapMode: Text.WordWrap
                                 color: "#6fbf88"
                                 font.pixelSize: 11
-                                text: "Verified — nothing is sent to the agent for this item."
-                            }
-                            Text {
-                                objectName: "sentRejectionNote"
-                                width: parent.width
-                                visible: clRow.sentRejection
-                                wrapMode: Text.WordWrap
-                                color: "#c98a94"
-                                font.pixelSize: 11
-                                text: "Rejected — sent to the agent."
+                                text: "Verified — goes to the agent with the next Send."
                             }
                             // Issue box (while editing): nothing is queued until
                             // "Add to batch" or Ctrl/⌘+Enter; Cancel / Esc closes it.
@@ -1342,7 +1343,7 @@ Item {
                                 width: parent.width
                                 spacing: 4
                                 visible: clRow.rowState === "rejected" && !clRow.editing
-                                         && clRow.savedComment.length > 0 && !clRow.sentRejection
+                                         && clRow.savedComment.length > 0
                                 Text {
                                     objectName: "rejectedText"
                                     width: parent.width
@@ -1374,7 +1375,7 @@ Item {
                                 }
                             }
                             Button {
-                                visible: clRow.rowState === "rejected" && !clRow.sentRejection
+                                visible: clRow.rowState === "rejected"
                                 text: root._repinFor === clRow.entryId
                                     ? "◎ Click an element…" : "⌖ Re-pin element"
                                 onClicked: root._startRepin(clRow.entryId)
@@ -1422,7 +1423,7 @@ Item {
                     spacing: 8
                     Button {
                         objectName: "annotateSend"
-                        text: "Send " + root.pendingCount + " to agent"
+                        text: root._sendLabel()
                         enabled: root.pendingCount > 0
                         onClicked: root.send()
                     }

@@ -151,6 +151,7 @@ test("buildVerificationItem carries kind/changelogId/comment over its context", 
     comment: "", // a raw extractContext snapshot has an empty comment — must not win
   });
   assert.equal(item.kind, "verification");
+  assert.equal(item.verdict, "rejected"); // default verdict
   assert.equal(item.changelogId, "c1");
   assert.equal(item.comment, "still orange"); // trimmed, and overrides context.comment
   assert.equal(item.selector, ".rating > svg");
@@ -167,8 +168,16 @@ test("applyRowState creates, replaces, and removes a verification item by change
   pending = applyRowState(pending, "c1", "rejected", "still bad", { selector: ".x" });
   assert.equal(pending.filter((p) => p.changelogId === "c1").length, 1);
   assert.equal(pending[0].comment, "still bad");
-  // Verified removes it.
-  pending = applyRowState(pending, "c1", "verified", "", { selector: ".x" });
+  assert.equal(pending[0].verdict, "rejected");
+  // Verified replaces it with a sign-off for the same id.
+  pending = applyRowState(pending, "c1", "verified", "", { selector: ".x" }, "Star gold");
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].verdict, "verified");
+  assert.equal(pending[0].title, "Star gold");
+  assert.equal(pending[0].comment, "");
+  assert.equal(pending[0].selector, ".x");
+  // Unset removes it.
+  pending = applyRowState(pending, "c1", "unset", "", { selector: ".x" });
   assert.equal(pending.length, 0);
   // An empty rejection comment also drops it (nothing to send yet).
   pending = applyRowState([{ kind: "verification", changelogId: "c1", comment: "x" }], "c1", "rejected", "   ", null);
@@ -185,4 +194,14 @@ test("applyRowState leaves pins and notes untouched (mixed queue stays one array
   assert.equal(pending.filter((p) => p.kind === "verification").length, 1);
   assert.equal(pending.filter((p) => p.kind === "note").length, 1);
   assert.equal(pending.filter((p) => !p.kind).length, 1); // the pin, unchanged
+});
+
+test("buildVerificationItem makes a verified sign-off with no comment", () => {
+  const item = buildVerificationItem("c2", "ignored", { selector: ".y", comment: "x" }, "verified", "Debounced");
+  assert.equal(item.kind, "verification");
+  assert.equal(item.verdict, "verified");
+  assert.equal(item.changelogId, "c2");
+  assert.equal(item.title, "Debounced");
+  assert.equal(item.comment, "");
+  assert.equal(item.selector, ".y");
 });

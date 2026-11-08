@@ -48,10 +48,12 @@ gracefully (no persistence, or its own derived value).
   restart lists every changelog item as unchecked again. When both are present the
   overlay calls `saveVerdicts(json)` whenever a verdict changes and `loadVerdicts()` once
   on startup. The value is a JSON object keyed by changelog id —
-  `{ "<id>": { "hash", "state": "verified"|"rejected", "comment", "sent", "at" } }` —
+  `{ "<id>": { "hash", "state": "verified"|"rejected", "comment", "sent", "at" } }`
+  (`sent` = the verdict already went out with a Send) —
   that the host stores verbatim and never parses; `"{}"` means no verdicts. `hash` covers
   the entry's title, description and context, so when the agent re-delivers an id with
-  changed content the stored verdict no longer matches and the row comes back unchecked.
+  changed content the stored verdict no longer matches and the row comes back unchecked;
+  an unchanged re-delivery of a sent verdict stays hidden.
   The overlay keeps at most 500 verdicts (oldest dropped). Without the hooks verdicts
   are in memory only, as before. (Reference host: `$ANNOTATE_STATE_DIR/verdicts.json`.)
 
@@ -114,20 +116,27 @@ The overlay branches on `type`: a `"changelog"` message becomes the checklist; a
 **Rejects** a row, describes the issue and clicks **Add to batch** (or presses Ctrl/⌘+Enter), the
 overlay queues a verification item into the same pending array it POSTs to `/__annotate/submit`
 (typing alone queues nothing; Cancel/Esc closes the box; an added rejection shows on its row with
-**Edit** / **Undo**). It is sent with the panel's next **Send**, never on its own:
+**Edit** / **Undo**). Clicking **Verified** queues a sign-off the same way (a second click undoes
+it). Both are sent with the panel's next **Send** (whose label counts sign-offs separately, e.g.
+"Send 1 · 2 verified to agent"), never on their own:
 
-    { "surface": "qml", "kind": "verification",
-      "changelogId": "c1", "comment": "still orange after the fix",
+    { "surface": "qml", "kind": "verification", "verdict": "rejected",
+      "changelogId": "c1", "title": "Star now gold", "comment": "still orange after the fix",
       // context auto-linked from the entry, or replaced by a re-pin:
       "objectName": "starBtn", "qmlType": "Button", "qmlFile": "Rating.qml", "typeChain": ["Row"] }
 
-After a successful Send the row is remembered as "Rejected — sent to the agent" and shown
-collapsed. With the `loadVerdicts`/`saveVerdicts` hooks that, Verified, and a rejection still
-waiting for Send survive an app restart, until the agent re-delivers the id with changed content.
-A checklist whose rows all have a verdict does not open the panel by itself.
+    { "surface": "qml", "kind": "verification", "verdict": "verified",
+      "changelogId": "c2", "title": "Debounced search", "comment": "",
+      "objectName": "", "qmlType": "", "qmlFile": "", "typeChain": [] }
+
+After a successful Send the sent rows leave the checklist (rows not in that Send stay); when
+none are left the checklist section disappears. With the `loadVerdicts`/`saveVerdicts` hooks the
+sent verdicts stay hidden when the server re-delivers the same ids (e.g. after an app restart),
+and verdicts still waiting for Send come back on their rows, until the agent re-delivers an id
+with changed content, which shows it again unchecked.
 
 `kind:"verification"` is the shared discriminator (the web overlay emits the same shape with its DOM
-context fields). Verified rows queue nothing — the agent infers them from the absence of a rejection.
+context fields). An item without `verdict` (from an older overlay) means rejected.
 All `title`/`description`/`comment` strings are rendered via `Text` only, never as markup.
 
 ## Host shim sketch — C++

@@ -22,6 +22,9 @@ the changed element's context — the same low-friction point-and-click the skil
   pending queue, one **Send**), distinguished on the wire by `kind: "verification"` and carrying the
   `changelogId` they answer plus their context — so the user can collect feedback across the checklist
   first and submit it all at once, as they do today.
+- Verified items are sent too, as `kind: "verification"` sign-offs with `verdict: "verified"` (a
+  rejection carries `verdict: "rejected"`), so the agent knows what was confirmed; a successful Send
+  removes the sent items from the checklist.
 - Extend the CLI `poll` with a **`--changelog`** input so the agent delivers the changelog over the
   existing agent→overlay `messages` channel (a typed message, alongside the plain `--agent-reply`);
   the agent still receives verification issues through the unchanged `poll`.

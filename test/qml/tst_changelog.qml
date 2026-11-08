@@ -64,13 +64,24 @@ TestCase {
         compare(overlay._pending.length, 1);
         var v = overlay._pending[0];
         compare(v.kind, "verification");
+        compare(v.verdict, "rejected");
+        compare(v.title, "Star");
         compare(v.surface, "qml");
         compare(v.changelogId, "c1");
         compare(v.comment, "still orange");
         compare(v.objectName, "starBtn");          // auto-linked from context
         compare(v.qmlType, "Button");
-        // Un-reject (Verified) drops the pending item — row and queue stay in sync.
+        // Switching to Verified replaces it with a verified sign-off (one item
+        // per changelogId), still tied to the entry's context.
         overlay._setRowState(e, "verified");
+        compare(overlay._pending.length, 1);
+        compare(overlay._pending[0].verdict, "verified");
+        compare(overlay._pending[0].changelogId, "c1");
+        compare(overlay._pending[0].title, "Star");
+        compare(overlay._pending[0].comment, "");
+        compare(overlay._pending[0].objectName, "starBtn");
+        // Back to unset drops it.
+        overlay._setRowState(e, "unset");
         compare(overlay._pending.length, 0);
     }
 
