@@ -809,6 +809,7 @@ Item {
     // ---- toggle pill + pending panel --------------------------------------
     Rectangle {
         id: pill
+        objectName: "annotatePill"
         z: 6
         anchors.left: parent.left
         anchors.bottom: parent.bottom
@@ -823,9 +824,18 @@ Item {
         // Toggle annotate mode (gated on a confirmed connection). Declared before
         // pillRow so the restore glyph's own MouseArea (a child of pillRow)
         // paints/handles on top of this and can swallow its click.
+        // Takes every button, the wheel and hover over the whole pill, so none
+        // of it reaches the app underneath; only a left click toggles.
         MouseArea {
             anchors.fill: parent
-            onClicked: root.requestAnnotate()
+            acceptedButtons: Qt.AllButtons
+            hoverEnabled: true
+            preventStealing: true
+            onClicked: mouse => {
+                if (mouse.button === Qt.LeftButton)
+                    root.requestAnnotate();
+            }
+            onWheel: wheel => { wheel.accepted = true; }
         }
         Row {
             id: pillRow
@@ -882,6 +892,18 @@ Item {
         readonly property real maxHeight: Math.max(120, pill.y - anchors.bottomMargin - 16)
         implicitHeight: 10 + header.height + 8 + pcol.implicitHeight + 10
         height: Math.min(implicitHeight, maxHeight)
+
+        // Swallow every mouse event on the panel's whole area (empty space,
+        // text, margins) so nothing falls through to the app beneath it. The
+        // controls and the scrolling body sit above this and still get theirs.
+        MouseArea {
+            objectName: "annotatePanelBlocker"
+            anchors.fill: parent
+            acceptedButtons: Qt.AllButtons
+            hoverEnabled: true
+            preventStealing: true
+            onWheel: wheel => { wheel.accepted = true; }
+        }
 
         // Header: title/count, annotate toggle and a "–" minimise button
         // (collapses to the pill). Outside the scrolling body so it is always
