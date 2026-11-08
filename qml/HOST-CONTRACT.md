@@ -42,6 +42,18 @@ gracefully (no persistence, or its own derived value).
   makes annotations survive a quit/crash or a relaunch-to-fix-the-URL; without the
   hooks the queue is in-memory only. (Reference host: writes
   `$ANNOTATE_STATE_DIR/pending.json`, clearing the file on an empty queue.)
+- `loadVerdicts() → string` / `saveVerdicts(json: string)` — **checklist-verdict
+  persistence** (optional, independent of the pending hooks). The callback server
+  re-delivers its last changelog to a freshly started overlay, so without these an app
+  restart lists every changelog item as unchecked again. When both are present the
+  overlay calls `saveVerdicts(json)` whenever a verdict changes and `loadVerdicts()` once
+  on startup. The value is a JSON object keyed by changelog id —
+  `{ "<id>": { "hash", "state": "verified"|"rejected", "comment", "sent", "at" } }` —
+  that the host stores verbatim and never parses; `"{}"` means no verdicts. `hash` covers
+  the entry's title, description and context, so when the agent re-delivers an id with
+  changed content the stored verdict no longer matches and the row comes back unchecked.
+  The overlay keeps at most 500 verdicts (oldest dropped). Without the hooks verdicts
+  are in memory only, as before. (Reference host: `$ANNOTATE_STATE_DIR/verdicts.json`.)
 
 ### Connection confirmation (overlay-side, no host code)
 
@@ -108,6 +120,11 @@ overlay queues a verification item into the same pending array it POSTs to `/__a
       "changelogId": "c1", "comment": "still orange after the fix",
       // context auto-linked from the entry, or replaced by a re-pin:
       "objectName": "starBtn", "qmlType": "Button", "qmlFile": "Rating.qml", "typeChain": ["Row"] }
+
+After a successful Send the row is remembered as "Rejected — sent to the agent" and shown
+collapsed. With the `loadVerdicts`/`saveVerdicts` hooks that, Verified, and a rejection still
+waiting for Send survive an app restart, until the agent re-delivers the id with changed content.
+A checklist whose rows all have a verdict does not open the panel by itself.
 
 `kind:"verification"` is the shared discriminator (the web overlay emits the same shape with its DOM
 context fields). Verified rows queue nothing — the agent infers them from the absence of a rejection.

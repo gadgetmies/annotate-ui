@@ -47,7 +47,8 @@ Item {
         serverUrlOverride.length > 0
             ? serverUrlOverride
             : ((typeof annotateServerUrl !== "undefined" && annotateServerUrl) ? annotateServerUrl : "")
-    readonly property var host: (typeof annotateHost !== "undefined") ? annotateHost : null
+    // Writable only so a test can hand an overlay a stub host at creation.
+    property var host: (typeof annotateHost !== "undefined") ? annotateHost : null
     function hasServer() { return root.serverUrl.length > 0; }
     // Connection health: did the callback server actually answer a probe (not
     // merely "a URL is configured")? Gates entering annotate mode + the pill state.
@@ -79,6 +80,15 @@ Item {
     // reassignment, so the Repeater never rebuilds and an open issue box keeps
     // focus); plain JS objects can't notify bindings, this counter does.
     property int _changelogRev: 0
+    // Checklist verdicts, kept across overlay restarts through the optional
+    // loadVerdicts/saveVerdicts host hooks (the callback server re-delivers its
+    // last changelog to a fresh overlay). Keyed by changelog id:
+    //   { hash, state: "verified"|"rejected", comment, sent, at }
+    // `hash` covers the entry's title, description and context, so a
+    // re-delivery of the same id with changed content ("fixed again, please
+    // re-check") no longer matches and the row comes back unset.
+    property var _verdicts: ({})
+    readonly property int _maxVerdicts: 500
 
     // ---- introspection (pure QML) ------------------------------------------
     // Reduce a `String(item)` like "QQuickButton(0x…)", "Button_QMLTYPE_1(0x…)",
@@ -215,7 +225,7 @@ Item {
                 if (next[j].id === e.id) { dup = true; break; }
             if (dup)
                 continue;
-            next.push({
+            var entry = {
                 "id": e.id,
                 "title": (typeof e.title === "string") ? e.title : e.id,
                 "description": (typeof e.description === "string") ? e.description : "",
@@ -224,10 +234,110 @@ Item {
                 "comment": "",
                 "draft": "",
                 "editing": false,
+                "sent": false,
                 "repin": null
-            });
+            };
+            entry.hash = root._entryHash(entry);
+            root._applyVerdict(entry);
+            next.push(entry);
         }
         root._changelog = next;
+    }
+    // Stable text for a value: object keys sorted, so the same content always
+    // hashes the same whatever order the agent wrote its JSON keys in.
+    function _canonical(v) {
+        if (v === null || typeof v !== "object")
+            return JSON.stringify(v === undefined ? null : v);
+        if (Array.isArray(v))
+            return "[" + v.map(root._canonical).join(",") + "]";
+        var keys = Object.keys(v).sort();
+        return "{" + keys.map(function (k) {
+            return JSON.stringify(k) + ":" + root._canonical(v[k]);
+        }).join(",") + "}";
+    }
+    // FNV-1a (32-bit) of an entry's title, description and context.
+    function _entryHash(entry) {
+        var str = root._canonical([entry.title, entry.description, entry.context]);
+        var h = 0x811c9dc5;
+        for (var i = 0; i < str.length; ++i) {
+            h ^= str.charCodeAt(i);
+            h = Math.imul(h, 0x01000193) >>> 0;
+        }
+        return ("0000000" + h.toString(16)).slice(-8);
+    }
+    // Restore a remembered verdict onto a freshly delivered entry, or forget a
+    // verdict whose entry changed (and drop its unsent rejection, which was
+    // about the old version).
+    function _applyVerdict(entry) {
+        var v = root._verdicts[entry.id];
+        if (!v)
+            return;
+        if (v.hash === entry.hash) {
+            entry.state = v.state;
+            entry.comment = v.comment || "";
+            entry.sent = v.sent === true;
+            return;
+        }
+        var next = {};
+        for (var k in root._verdicts)
+            if (k !== entry.id)
+                next[k] = root._verdicts[k];
+        root._verdicts = next;
+        root._saveVerdicts();
+        root._updateVerification(entry);   // unset → drops a stale queued item
+        root._setStatus("Some changes were updated by the agent — please check them again", false);
+    }
+    // Record (or clear) a row's verdict after any change to it. Only finished
+    // verdicts are kept: verified, or rejected with an added comment.
+    function _recordVerdict(entry) {
+        var next = {};
+        for (var k in root._verdicts)
+            if (k !== entry.id)
+                next[k] = root._verdicts[k];
+        var comment = String(entry.comment || "").trim();
+        if (entry.state === "verified" || (entry.state === "rejected" && comment.length > 0)) {
+            next[entry.id] = {
+                "hash": entry.hash || root._entryHash(entry),
+                "state": entry.state,
+                "comment": entry.state === "rejected" ? comment : "",
+                "sent": entry.state === "rejected" && entry.sent === true,
+                "at": Date.now()
+            };
+        }
+        // Keep the store bounded: drop the oldest beyond _maxVerdicts.
+        var ids = Object.keys(next);
+        if (ids.length > root._maxVerdicts) {
+            ids.sort(function (a, b) { return (next[a].at || 0) - (next[b].at || 0); });
+            for (var i = 0; i < ids.length - root._maxVerdicts; ++i)
+                delete next[ids[i]];
+        }
+        root._verdicts = next;
+        root._saveVerdicts();
+    }
+    function _saveVerdicts() {
+        if (root.host && root.host.saveVerdicts)
+            root.host.saveVerdicts(JSON.stringify(root._verdicts));
+    }
+    function _restoreVerdicts() {
+        if (!(root.host && root.host.loadVerdicts))
+            return;
+        try {
+            var raw = root.host.loadVerdicts();
+            var obj = raw ? JSON.parse(raw) : {};
+            if (obj && typeof obj === "object" && !Array.isArray(obj))
+                root._verdicts = obj;
+        } catch (e) { /* corrupt/absent → start empty */ }
+    }
+    // Rows the user still has to act on (unset, or a rejection not yet sent).
+    function _openRowCount() {
+        var rev = root._changelogRev;   // dependency only
+        var n = 0;
+        for (var i = 0; i < root._changelog.length; ++i) {
+            var e = root._changelog[i];
+            if (!(e.state === "verified" || (e.state === "rejected" && e.sent)))
+                n++;
+        }
+        return n;
     }
     // The live entry for a changelogId (or for an entry-like object, by its id).
     // Delegates must go through this: a Repeater over a JS array hands each
@@ -300,7 +410,9 @@ Item {
             // A rejection without an added issue opens its issue box.
             entry.editing = String(entry.comment || "").trim().length === 0;
         }
+        entry.sent = false;
         root._updateVerification(entry);
+        root._recordVerdict(entry);
         root._changelogRev++;
     }
     // The Rejected button: opens the issue box on an unset/verified row, and
@@ -325,7 +437,9 @@ Item {
         entry.comment = t;
         entry.draft = "";
         entry.editing = false;
+        entry.sent = false;
         root._updateVerification(entry);
+        root._recordVerdict(entry);
         root._changelogRev++;
         root._setStatus("Rejection added — it goes to the agent with the next Send", false);
         return true;
@@ -481,6 +595,31 @@ Item {
                    ? (root.pendingCount + " queued pin(s) are kept.") : "pins will be kept."), true);
         });
     }
+    // A batch reached the server: clear the queue, remember the batch's
+    // rejections as sent, and close this verification round.
+    function _sendSucceeded(batch) {
+        root._pending = [];
+        root.pendingCount = 0;
+        root._persist();          // clears the on-disk queue too
+        // Rejections in this batch are now with the agent: remember them
+        // as sent, so a restart shows them collapsed, not unset.
+        var nv = {};
+        for (var k in root._verdicts)
+            nv[k] = root._verdicts[k];
+        for (var b = 0; b < batch.length; ++b) {
+            var it = batch[b];
+            var v = (it && it.kind === "verification") ? nv[it.changelogId] : null;
+            if (v && v.state === "rejected")
+                nv[it.changelogId] = { "hash": v.hash, "state": "rejected",
+                    "comment": v.comment, "sent": true, "at": Date.now() };
+        }
+        root._verdicts = nv;
+        root._saveVerdicts();
+        root._changelog = [];     // the verification round went with it
+        root._repinFor = "";
+        root.connected = true;
+        root._setStatus("Sent to agent ✓", false);
+    }
     function send() {
         if (!root._pending.length)
             return;
@@ -494,13 +633,7 @@ Item {
             if (xhr.readyState !== XMLHttpRequest.DONE)
                 return;
             if (xhr.status >= 200 && xhr.status < 300) {
-                root._pending = [];
-                root.pendingCount = 0;
-                root._persist();          // clears the on-disk queue too
-                root._changelog = [];     // the verification round went with it
-                root._repinFor = "";
-                root.connected = true;
-                root._setStatus("Sent to agent ✓", false);
+                root._sendSucceeded(batch);
             } else {
                 root._setStatus("Send failed (server down?) — pins kept, retry", true);
             }
@@ -567,6 +700,7 @@ Item {
     // pill reflects real reachability from the moment the overlay appears.
     Component.onCompleted: {
         root._restorePending();
+        root._restoreVerdicts();
         root.checkConnection();
     }
 
@@ -878,7 +1012,9 @@ Item {
         // Shown while annotating OR disconnected (so the recovery UI is reachable)
         // OR whenever a verification checklist is present (so the user can sign off
         // on it without first entering annotate mode).
-        visible: (root.annotating || !root.connected || root._changelog.length > 0) && !root.minimized
+        // A checklist whose rows all have a verdict (verified / rejection sent)
+        // does not pop the panel open by itself, e.g. after a restart.
+        visible: (root.annotating || !root.connected || root._openRowCount() > 0) && !root.minimized
         anchors.left: parent.left
         anchors.bottom: pill.top
         anchors.leftMargin: 16
@@ -1071,6 +1207,11 @@ Item {
                             readonly property string entryId: modelData.id
                             readonly property string rowState: root._rowField(entryId, "state") || "unset"
                             readonly property bool verified: rowState === "verified"
+                            // A rejection already sent to the agent: shown collapsed,
+                            // no controls, until the agent re-delivers it changed.
+                            readonly property bool sentRejection: rowState === "rejected"
+                                && root._rowField(entryId, "sent") === true
+                            readonly property bool collapsed: verified || sentRejection
                             readonly property bool editing: rowState === "rejected"
                                 && (root._rowField(entryId, "editing") === true)
                             readonly property string savedComment: root._rowField(entryId, "comment") || ""
@@ -1080,20 +1221,21 @@ Item {
                             Text {
                                 width: parent.width
                                 wrapMode: Text.WordWrap
-                                color: clRow.verified ? "#9dffb0" : "#e8eaed"
-                                opacity: clRow.verified ? 0.75 : 1
+                                color: clRow.verified ? "#9dffb0" : (clRow.sentRejection ? "#ffb3be" : "#e8eaed")
+                                opacity: clRow.collapsed ? 0.75 : 1
                                 font.pixelSize: 13
-                                text: (clRow.verified ? "✓ " : "") + clRow.modelData.title
+                                text: (clRow.verified ? "✓ " : (clRow.sentRejection ? "✕ " : "")) + clRow.modelData.title
                             }
                             Text {
                                 width: parent.width
-                                visible: !clRow.verified && clRow.modelData.description.length > 0
+                                visible: !clRow.collapsed && clRow.modelData.description.length > 0
                                 wrapMode: Text.WordWrap
                                 color: "#8b9199"
                                 font.pixelSize: 11
                                 text: clRow.modelData.description
                             }
                             Row {
+                                visible: !clRow.sentRejection
                                 spacing: 6
                                 RowToggle {
                                     objectName: "verifyButton"
@@ -1131,6 +1273,15 @@ Item {
                                 color: "#6fbf88"
                                 font.pixelSize: 11
                                 text: "Verified — nothing is sent to the agent for this item."
+                            }
+                            Text {
+                                objectName: "sentRejectionNote"
+                                width: parent.width
+                                visible: clRow.sentRejection
+                                wrapMode: Text.WordWrap
+                                color: "#c98a94"
+                                font.pixelSize: 11
+                                text: "Rejected — sent to the agent."
                             }
                             // Issue box (while editing): nothing is queued until
                             // "Add to batch" or Ctrl/⌘+Enter; Cancel / Esc closes it.
@@ -1187,7 +1338,7 @@ Item {
                                 width: parent.width
                                 spacing: 4
                                 visible: clRow.rowState === "rejected" && !clRow.editing
-                                         && clRow.savedComment.length > 0
+                                         && clRow.savedComment.length > 0 && !clRow.sentRejection
                                 Text {
                                     objectName: "rejectedText"
                                     width: parent.width
@@ -1219,7 +1370,7 @@ Item {
                                 }
                             }
                             Button {
-                                visible: clRow.rowState === "rejected"
+                                visible: clRow.rowState === "rejected" && !clRow.sentRejection
                                 text: root._repinFor === clRow.entryId
                                     ? "◎ Click an element…" : "⌖ Re-pin element"
                                 onClicked: root._startRepin(clRow.entryId)
