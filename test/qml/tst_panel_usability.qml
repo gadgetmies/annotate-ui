@@ -86,4 +86,27 @@ TestCase {
         compare(p.height, p.implicitHeight);
         compare(findChild(overlay, "annotatePanelScrollBar").policy, ScrollBar.AlwaysOff);
     }
+
+    // Annotate mode hides the checklist and the discussion; the composer and
+    // Send stay. Leaving annotate mode shows them again.
+    function test_04_annotate_mode_hides_checklist_and_messages() {
+        reset();
+        many(2);
+        overlay._appendMessage("Fixed the star colour");
+        waitForRendering(overlay);
+        var cl = findChild(overlay, "annotateChecklist");
+        var msgs = findChild(overlay, "annotateMessages");
+        verify(cl.visible);
+        verify(msgs.visible);
+        overlay.annotating = true;
+        verify(!cl.visible, "checklist hidden while annotating");
+        verify(!msgs.visible, "agent replies hidden while annotating");
+        verify(findChild(overlay, "annotateHiddenHint").visible);
+        verify(findChild(overlay, "annotateNoteField").visible, "note composer kept");
+        verify(findChild(overlay, "annotateSend").visible, "Send kept");
+        overlay.annotating = false;
+        verify(cl.visible);
+        verify(msgs.visible);
+        verify(!findChild(overlay, "annotateHiddenHint").visible);
+    }
 }

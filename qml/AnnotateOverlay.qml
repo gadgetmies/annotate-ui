@@ -881,14 +881,28 @@ Item {
                         onClicked: doConnect()
                     }
                 }
+                // While annotating, say where the checklist and replies went.
+                Text {
+                    objectName: "annotateHiddenHint"
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    color: "#6b7178"
+                    font.pixelSize: 11
+                    font.italic: true
+                    visible: root.annotating && (root._changelog.length > 0 || msgs.children.length > 0)
+                    text: "Checklist and agent replies are hidden while annotating — press Esc or Stop annotating to see them."
+                }
                 // Verification checklist — one row per agent-delivered changelog entry,
                 // mirroring the web overlay. Renders all user/agent strings via `Text`
                 // only (never as markup).
                 Column {
                     id: checklist
+                    objectName: "annotateChecklist"
                     width: parent.width
                     spacing: 6
-                    visible: root._changelog.length > 0
+                    // Hidden while annotating: picking needs only the composer
+                    // and Send, and the checklist would cover the app.
+                    visible: root._changelog.length > 0 && !root.annotating
                     Text {
                         width: parent.width
                         color: "#9aa0a6"
@@ -976,6 +990,7 @@ Item {
                 // Freeform note (not tied to an element) — mirrors the web composer.
                 TextArea {
                     id: noteField
+                    objectName: "annotateNoteField"
                     width: parent.width
                     wrapMode: TextArea.Wrap
                     placeholderText: "Add a note… (Ctrl+Enter or click Add)"
@@ -1011,6 +1026,7 @@ Item {
                 Row {
                     spacing: 8
                     Button {
+                        objectName: "annotateSend"
                         text: "Send " + root.pendingCount + " to agent"
                         enabled: root.pendingCount > 0
                         onClicked: root.send()
@@ -1031,7 +1047,7 @@ Item {
                     id: msgs
                     objectName: "annotateMessages"
                     width: parent.width
-                    visible: children.length > 0
+                    visible: children.length > 0 && !root.annotating
                     spacing: 4
                 }
             }
