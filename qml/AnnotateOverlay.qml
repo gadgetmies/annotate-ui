@@ -861,6 +861,7 @@ Item {
     // ---- comment box -------------------------------------------------------
     Rectangle {
         id: comment
+        objectName: "annotateCommentBox"
         visible: false
         z: 5
         width: 300
@@ -873,7 +874,9 @@ Item {
         property var header: ({})
 
         function openFor(item, px, py) {
-            header = root.beginPin(item);  // snapshot NOW
+            // Qualified: an unqualified `header` would resolve to any element
+            // id of that name in this file before this property.
+            comment.header = root.beginPin(item);  // snapshot NOW
             field.text = "";
             x = Math.min(px, root.width - width - 8);
             y = Math.min(py, root.height - height - 8);
@@ -899,6 +902,7 @@ Item {
             }
             TextField {
                 id: field
+                objectName: "annotateCommentField"
                 width: parent.width
                 placeholderText: "What needs fixing here? (Ctrl+Enter to add)"
                 color: "#e8eaed"
@@ -1026,7 +1030,7 @@ Item {
         // Never taller than the window: the room above the pill, less a top
         // margin. The header stays put; the body scrolls inside what is left.
         readonly property real maxHeight: Math.max(120, pill.y - anchors.bottomMargin - 16)
-        implicitHeight: 10 + header.height + 8 + pcol.implicitHeight + 10
+        implicitHeight: 10 + panelHeader.height + 8 + pcol.implicitHeight + 10
         height: Math.min(implicitHeight, maxHeight)
 
         // Swallow every mouse event on the panel's whole area (empty space,
@@ -1045,7 +1049,7 @@ Item {
         // (collapses to the pill). Outside the scrolling body so it is always
         // reachable however long the checklist or the discussion gets.
         Item {
-            id: header
+            id: panelHeader
             objectName: "annotatePanelHeader"
             anchors.top: parent.top
             anchors.left: parent.left
@@ -1093,7 +1097,7 @@ Item {
         Flickable {
             id: body
             objectName: "annotatePanelBody"
-            anchors.top: header.bottom
+            anchors.top: panelHeader.bottom
             anchors.topMargin: 8
             anchors.left: parent.left
             anchors.right: parent.right
